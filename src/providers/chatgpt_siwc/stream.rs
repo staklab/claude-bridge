@@ -1,7 +1,7 @@
 //! Incremental, bounded SSE parsing plus SIWC completion/tool integrity checks.
 use super::{
     auth::{Auth, read_json},
-    client::{ApiError, ResponseContext, ResponseInfo},
+    client::{ApiError, ResponseContext, ResponseInfo, response_error_status},
 };
 
 pub(super) type UsagePause = std::sync::Arc<std::sync::Mutex<Option<ApiError>>>;
@@ -42,6 +42,21 @@ use std::{
 
 const MAX_FRAME: usize = 8 * 1024 * 1024;
 const MAX_BUFFERED_RESPONSE: usize = 32 * 1024 * 1024;
+const PROBE_TIMEOUT: Duration = Duration::from_secs(90);
+
+fn safe_event_type(kind: &str) -> &'static str {
+    match kind {
+        "response.created" => "response.created",
+        "response.in_progress" => "response.in_progress",
+        "response.output_text.delta" => "response.output_text.delta",
+        "response.output_item.added" => "response.output_item.added",
+        "response.completed" => "response.completed",
+        "response.failed" => "response.failed",
+        "response.incomplete" => "response.incomplete",
+        "error" => "error",
+        _ => "other_event",
+    }
+}
 
 #[derive(Default)]
 pub(super) struct Decoder {
@@ -50,6 +65,7 @@ pub(super) struct Decoder {
     size: usize,
     skip_lf: bool,
     event: Option<String>,
+    started: bool,
     pub events: VecDeque<Value>,
 }
 impl Decoder {
@@ -65,6 +81,12 @@ impl Decoder {
                 self.skip_lf = byte == b'\r';
                 let line = String::from_utf8(std::mem::take(&mut self.line))
                     .map_err(|_| protocol("Invalid UTF-8 in SSE"))?;
+                let line = if !self.started {
+                    self.started = true;
+                    line.trim_start_matches('\u{feff}')
+                } else {
+                    &line
+                };
                 if line.is_empty() {
                     if !self.data.is_empty() {
                         let data = self.data.join("\n");
@@ -75,6 +97,9 @@ impl Decoder {
                         }
                         let mut value: Value = serde_json::from_str(&data)
                             .map_err(|_| protocol("Invalid JSON in SSE event"))?;
+                        if !value.is_object() {
+                            return Err(protocol("SSE event data must be an object"));
+                        }
                         if value.get("type").is_none()
                             && let Some(event) = &self.event
                         {
@@ -86,7 +111,7 @@ impl Decoder {
                     self.event = None;
                     self.size = 0;
                 } else if !line.starts_with(':') {
-                    let (field, value) = line.split_once(':').unwrap_or((&line, ""));
+                    let (field, value) = line.split_once(':').unwrap_or((line, ""));
                     let value = value.strip_prefix(' ').unwrap_or(value);
                     match field {
                         "data" => self.data.push(value.into()),
@@ -111,6 +136,9 @@ fn protocol(message: &str) -> ApiError {
 }
 
 fn with_request_id(mut response: Response, info: &ResponseInfo) -> Response {
+    response
+        .headers_mut()
+        .insert("x-should-retry", "false".parse().expect("static header"));
     if let Some(id) = &info.request_id
         && let Ok(id) = id.parse()
     {
@@ -129,6 +157,7 @@ struct Call {
 
 pub(super) struct Reader {
     response: reqwest::Response,
+    pending: Option<Bytes>,
     decoder: Decoder,
     names: HashSet<String>,
     calls: HashMap<u64, Call>,
@@ -146,9 +175,10 @@ impl Reader {
         names: HashSet<String>,
         auth: Auth,
     ) -> Result<Self, ApiError> {
-        let context = ResponseContext::from_response(&response);
+        let mut context = ResponseContext::from_response(&response);
         // HTTP admission errors must be classified before applying the stream contract.
         if !response.status().is_success() {
+            context.info.response_class = Some("http_error");
             let raw = tokio::time::timeout(Duration::from_secs(15), read_json(response))
                 .await
                 .ok()
@@ -166,11 +196,19 @@ impl Reader {
                 .ok()
                 .and_then(Result::ok)
                 .unwrap_or(Value::Null);
+            context.info.response_class = Some(if raw.get("error").is_some() {
+                "json_error"
+            } else if !raw.is_null() {
+                "json"
+            } else {
+                "non_sse"
+            });
             return Err(context.unexpected_type(raw));
         }
         let missing_type = context.info.content_type.is_none();
         let mut reader = Self {
             response,
+            pending: None,
             decoder: Decoder::default(),
             names,
             calls: HashMap::new(),
@@ -183,68 +221,100 @@ impl Reader {
             last_ping: tokio::time::Instant::now(),
         };
         if missing_type {
-            // Some direct-route responses omit Content-Type. Accept only a bounded,
-            // verified Responses SSE prelude; JSON/HTML never becomes a successful stream.
+            // The first response.created can echo large instructions/tools. Its bound
+            // must match the ordinary SSE frame bound, not a smaller HTTP-chunk cap.
             reader.detect_sse().await?;
-            let diagnostic = ApiError::local(
-                StatusCode::OK,
-                "siwc_sse_content_type_missing",
-                "Verified Responses SSE without Content-Type",
-            )
-            .with_upstream(&reader.context.info);
-            crate::logging::create_logger("siwc").warn(
-                "siwc_sse_content_type_missing",
-                diagnostic.diagnostics().as_object().cloned(),
-            );
+            reader.report_classification();
         }
         Ok(reader)
     }
     async fn detect_sse(&mut self) -> Result<(), ApiError> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let deadline = tokio::time::Instant::now() + PROBE_TIMEOUT;
         let mut prefix = Vec::new();
         loop {
-            let chunk = tokio::time::timeout_at(deadline, self.response.chunk())
-                .await
-                .ok()
-                .and_then(Result::ok)
-                .flatten();
-            let Some(chunk) = chunk else {
-                return Err(self
-                    .context
-                    .unexpected_type(serde_json::from_slice(&prefix).unwrap_or(Value::Null)));
+            let result = tokio::time::timeout_at(deadline, self.response.chunk()).await;
+            let classification = match &result {
+                Err(_) => "probe_timeout",
+                Ok(Err(_)) => "transport_error",
+                Ok(Ok(None)) if prefix.is_empty() => "empty",
+                _ => "incomplete_sse",
             };
-            if prefix.len() + chunk.len() > 64 * 1024 {
-                return Err(self.context.unexpected_type(Value::Null));
-            }
-            prefix.extend_from_slice(&chunk);
-            if matches!(
-                prefix.iter().copied().find(|b| !b.is_ascii_whitespace()),
-                Some(b'{' | b'[')
-            ) {
-                if let Ok(raw) = serde_json::from_slice::<Value>(&prefix) {
-                    return Err(self.context.unexpected_type(raw));
+            let chunk = result.ok().and_then(Result::ok).flatten();
+            let Some(chunk) = chunk else {
+                return Err(self.classification_error(classification, &prefix));
+            };
+            // Feed complete line segments only until the first complete event. Keep
+            // the rest of this transport chunk for next(), including later failures.
+            let mut offset = 0;
+            while offset < chunk.len() {
+                let end = chunk[offset..]
+                    .iter()
+                    .position(|b| matches!(b, b'\r' | b'\n'))
+                    .map(|i| offset + i + 1)
+                    .unwrap_or(chunk.len());
+                if prefix.len() + end - offset > MAX_FRAME {
+                    return Err(self.classification_error("probe_limit", &prefix));
                 }
-                continue;
-            }
-            self.decoder
-                .push(&chunk)
-                .map_err(|_| self.context.unexpected_type(Value::Null))?;
-            if let Some(event) = self.decoder.events.front() {
-                if !event["type"]
-                    .as_str()
-                    .is_some_and(|kind| kind.starts_with("response.") || kind == "error")
-                {
-                    return Err(self.context.unexpected_type(Value::Null));
+                prefix.extend_from_slice(&chunk[offset..end]);
+                let first = prefix.iter().copied().find(|b| !b.is_ascii_whitespace());
+                if matches!(first, Some(b'{' | b'[')) {
+                    if serde_json::from_slice::<Value>(&prefix).is_ok() {
+                        return Err(self.classification_error("json", &prefix));
+                    }
+                } else {
+                    if first == Some(b'<') {
+                        return Err(self.classification_error("html_or_xml", &prefix));
+                    }
+                    if self.decoder.push(&chunk[offset..end]).is_err() {
+                        return Err(self.classification_error("invalid_sse", &prefix));
+                    }
+                    if let Some(event) = self.decoder.events.front() {
+                        let kind = event["type"].as_str().unwrap_or("");
+                        if !(kind.starts_with("response.") || kind == "error") {
+                            return Err(self.classification_error("unrecognized_event", &prefix));
+                        }
+                        self.context.info.response_class = Some("responses_sse");
+                        self.context.info.first_event_type = Some(safe_event_type(kind));
+                        self.context.info.probe_bytes = prefix.len();
+                        self.pending = (end < chunk.len()).then(|| chunk.slice(end..));
+                        self.last_chunk = tokio::time::Instant::now();
+                        return Ok(());
+                    }
                 }
-                self.last_chunk = tokio::time::Instant::now();
-                return Ok(());
+                offset = end;
             }
+        }
+    }
+    fn classification_error(&mut self, classification: &'static str, prefix: &[u8]) -> ApiError {
+        let raw = serde_json::from_slice::<Value>(prefix).unwrap_or(Value::Null);
+        self.context.info.response_class = Some(if raw.get("error").is_some() {
+            "json_error"
+        } else {
+            classification
+        });
+        self.context.info.probe_bytes = prefix.len();
+        self.context.unexpected_type(raw)
+    }
+    fn report_classification(&self) {
+        let diagnostic = ApiError::local(StatusCode::OK, "", "").with_upstream(&self.context.info);
+        let logger = crate::logging::create_logger("siwc");
+        if self.context.info.content_type.is_none() {
+            logger.warn(
+                "siwc_response_classification",
+                diagnostic.diagnostics().as_object().cloned(),
+            );
+        } else {
+            logger.info(
+                "siwc_response_classification",
+                diagnostic.diagnostics().as_object().cloned(),
+            );
         }
     }
     pub async fn next(&mut self) -> Result<Option<Value>, ApiError> {
         self.next_inner().await.map_err(|mut error| {
             error.body = self.context.sanitize(error.body);
             error = error.with_upstream(&self.context.info);
+            self.context.remember_failure(&error);
             error.report();
             error
         })
@@ -263,11 +333,21 @@ impl Reader {
                 self.last_check = tokio::time::Instant::now();
             }
             if let Some(mut value) = self.decoder.events.pop_front() {
+                if self.context.info.first_event_type.is_none() {
+                    self.context.info.response_class = Some("responses_sse");
+                    self.context.info.first_event_type =
+                        Some(safe_event_type(value["type"].as_str().unwrap_or("")));
+                    self.report_classification();
+                }
                 if value["type"] == "response.refusal.delta" {
                     value["type"] = json!("response.output_text.delta");
                 }
                 self.validate(&value)?;
                 return Ok(Some(value));
+            }
+            if let Some(bytes) = self.pending.take() {
+                self.decoder.push(&bytes)?;
+                continue;
             }
             if self.last_chunk.elapsed() >= Duration::from_secs(90) {
                 return Err(protocol(
@@ -301,20 +381,7 @@ impl Reader {
         match kind {
             "error" | "response.failed" | "response.incomplete" => {
                 let error = value.get("error").or_else(|| value.pointer("/response/error")).filter(|v| !v.is_null()).or_else(|| (kind == "error" && (value.get("code").is_some() || value.get("message").is_some())).then_some(value)).cloned().unwrap_or_else(|| json!({"code":"response_incomplete","message":"SIWC response did not complete"}));
-                let status = match error["code"].as_str().unwrap_or("") {
-                    "subscription_sharing_usage_limit_exceeded" | "rate_limit_exceeded" => {
-                        StatusCode::TOO_MANY_REQUESTS
-                    }
-                    "subscription_sharing_usage_unavailable"
-                    | "subscription_sharing_user_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
-                    "subscription_sharing_user_not_eligible"
-                    | "subscription_sharing_route_not_supported"
-                    | "chatpass_v2_scope_not_authorized"
-                    | "chatpass_v2_invalid_authorization_context" => StatusCode::FORBIDDEN,
-                    "subscription_sharing_invalid_user" => StatusCode::UNAUTHORIZED,
-                    "subscription_sharing_unsupported_capability" => StatusCode::BAD_REQUEST,
-                    _ => StatusCode::BAD_GATEWAY,
-                };
+                let status = response_error_status(error["code"].as_str().unwrap_or(""));
                 return Err(ApiError {
                     status,
                     body: json!({"error":error,"event":value}),
@@ -471,6 +538,7 @@ pub(super) async fn response(
     let reader = match Reader::new(response, names, auth).await {
         Ok(reader) => reader,
         Err(e) => {
+            pause_on_limit(&pause, &e);
             e.report();
             return e.response();
         }
@@ -488,9 +556,10 @@ pub(super) async fn response(
                         &event.to_string(),
                     ));
                     if bytes.len() > MAX_BUFFERED_RESPONSE {
-                        return protocol("Buffered response exceeds limit; use streaming")
-                            .with_upstream(&info)
-                            .response();
+                        let error = protocol("Buffered response exceeds limit; use streaming")
+                            .with_upstream(&info);
+                        reader.context.remember_failure(&error);
+                        return error.response();
                     }
                 }
                 Ok(None) => break,
@@ -502,9 +571,11 @@ pub(super) async fn response(
         }
         let response = match accumulate_response(&bytes, &id, &model) {
             Ok(value) => axum::Json(value).into_response(),
-            Err(_) => protocol("Could not translate completed response")
-                .with_upstream(&info)
-                .response(),
+            Err(_) => {
+                let error = protocol("Could not translate completed response").with_upstream(&info);
+                reader.context.remember_failure(&error);
+                error.response()
+            }
         };
         return with_request_id(response, &info);
     }
@@ -543,6 +614,7 @@ pub(super) async fn response(
                         state.outcome.fail();
                         let e = protocol("Could not translate Responses stream")
                             .with_upstream(&state.reader.context.info);
+                        state.reader.context.remember_failure(&e);
                         e.report();
                         let bytes = crate::anthropic::sse::encode_sse_event(
                             Some("error"),

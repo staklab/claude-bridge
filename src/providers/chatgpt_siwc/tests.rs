@@ -39,6 +39,8 @@ struct MockData {
     response_content_type: Option<Option<String>>,
     request_id_header: String,
     disconnect_stream: bool,
+    response_chunk_bytes: Option<usize>,
+    initial_stream_delay: std::time::Duration,
 }
 struct Mock {
     data: Arc<Mutex<MockData>>,
@@ -69,6 +71,8 @@ impl Mock {
             response_content_type: None,
             request_id_header: "x-request-id".into(),
             disconnect_stream: false,
+            response_chunk_bytes: None,
+            initial_stream_delay: std::time::Duration::ZERO,
         }));
         let app = Router::new()
             .fallback(any(mock_handler))
@@ -142,6 +146,16 @@ async fn mock_handler(
                 headers.insert("content-type", content_type.parse().unwrap());
             }
             headers.insert(data.request_id_header.parse::<axum::http::HeaderName>().unwrap(), "req_siwc_mock".parse().unwrap());
+            if let Some(chunk_bytes) = data.response_chunk_bytes {
+                let chunks = body.as_bytes().chunks(chunk_bytes).map(bytes::Bytes::copy_from_slice).collect::<Vec<_>>();
+                let delay = data.initial_stream_delay;
+                let stream = futures_util::stream::unfold((0, chunks), move |(index, chunks)| async move {
+                    if index >= chunks.len() { return None; }
+                    if index == 0 { tokio::time::sleep(delay).await; }
+                    Some((Ok::<_,std::io::Error>(chunks[index].clone()), (index + 1, chunks)))
+                });
+                return (status, headers, Body::from_stream(stream)).into_response();
+            }
             if data.disconnect_stream {
                 let stream = futures_util::stream::unfold((0, body), |(index, body)| async move {
                     match index {
@@ -720,7 +734,6 @@ async fn http_errors_preserve_status_shape_codes_and_request_id_without_retrying
     let mock = Mock::new().await;
     let dir = tempfile::tempdir().unwrap();
     let auth = signed_in(&mock, Store::new(dir.path().join("siwc"))).await;
-    let client = Client::new(auth);
     for (status, error) in [
         (401, json!({"detail":"identity refused"})),
         (
@@ -736,6 +749,7 @@ async fn http_errors_preserve_status_shape_codes_and_request_id_without_retrying
             json!({"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"app limit"}}),
         ),
     ] {
+        let client = Client::new(auth.clone());
         mock.reply(StatusCode::from_u16(status).unwrap(), error.to_string());
         let e = client.responses(&json!({})).await.unwrap_err();
         assert_eq!(e.status.as_u16(), status);
@@ -747,23 +761,31 @@ async fn http_errors_preserve_status_shape_codes_and_request_id_without_retrying
 }
 
 #[tokio::test]
-async fn unavailable_route_retries_at_most_three_times_and_redirects_are_blocked() {
+async fn inference_503_is_not_replayed_and_redirects_are_blocked() {
     let mock = Mock::new().await;
     let dir = tempfile::tempdir().unwrap();
     let auth = signed_in(&mock, Store::new(dir.path().join("siwc"))).await;
     let client = Client::new(auth);
-    for _ in 0..3 {
-        mock.reply(
-            StatusCode::SERVICE_UNAVAILABLE,
-            json!({"detail":"route unavailable"}).to_string(),
-        );
-    }
-    assert_eq!(client.responses(&json!({})).await.unwrap_err().status, 503);
-    assert_eq!(mock.count("/v1/responses"), 3);
+    mock.reply(
+        StatusCode::SERVICE_UNAVAILABLE,
+        json!({"error":{"code":"subscription_sharing_usage_unavailable","message":"try later"}})
+            .to_string(),
+    );
+    let error = client.responses(&json!({})).await.unwrap_err();
+    assert_eq!(error.status, 503);
+    assert_eq!(error.response().headers()["x-should-retry"], "false");
+    assert_eq!(mock.count("/v1/responses"), 1);
     let other = Mock::new().await;
     mock.data.lock().unwrap().redirect =
         Some(format!("{}/v1/responses", other.data.lock().unwrap().base));
-    assert_eq!(client.responses(&json!({})).await.unwrap_err().status, 307);
+    assert_eq!(
+        client
+            .responses(&json!({"different_request":true}))
+            .await
+            .unwrap_err()
+            .status,
+        307
+    );
     assert_eq!(other.count("/v1/responses"), 0);
 }
 
@@ -772,8 +794,8 @@ async fn failed_incomplete_and_disconnected_streams_never_emit_success() {
     let mock = Mock::new().await;
     let dir = tempfile::tempdir().unwrap();
     let auth = signed_in(&mock, Store::new(dir.path().join("siwc"))).await;
-    let p = provider(auth);
     for ending in ["", "data: [DONE]\n\n", "data: broken\n\n"] {
+        let p = provider(auth.clone());
         mock.reply(
             StatusCode::OK,
             format!(
@@ -789,13 +811,13 @@ async fn failed_incomplete_and_disconnected_streams_never_emit_success() {
         assert!(!text.contains("message_stop"));
     }
     for kind in ["response.failed", "response.incomplete"] {
-        *p.client.usage_pause.lock().unwrap() = None;
+        let p = provider(auth.clone());
         mock.reply(StatusCode::OK,event(json!({"type":kind,"response":{"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"limit reached"}}})));
         let text = body(p.handle_messages(request(true), context()).await).await;
         assert!(text.contains("subscription_sharing_usage_limit_exceeded"));
         assert!(!text.contains("message_stop"));
     }
-    *p.client.usage_pause.lock().unwrap() = None;
+    let p = provider(auth);
     mock.reply(StatusCode::OK, String::new());
     assert_eq!(
         p.handle_messages(request(false), context()).await.status(),
@@ -829,6 +851,17 @@ fn sse_decoder_handles_utf8_fragmentation_crlf_and_multiline_data() {
         decoder.push(&[*b]).unwrap();
     }
     assert_eq!(decoder.events.pop_front().unwrap()["delta"], "你好");
+    let mut decoder = stream::Decoder::default();
+    for b in "\u{feff}event: response.created\ndata: {}\n\n".as_bytes() {
+        decoder.push(&[*b]).unwrap();
+    }
+    assert_eq!(
+        decoder.events.pop_front().unwrap()["type"],
+        "response.created"
+    );
+    for invalid in ["data: []\n\n", "event: response.created\ndata: 42\n\n"] {
+        assert!(stream::Decoder::default().push(invalid.as_bytes()).is_err());
+    }
 }
 
 #[tokio::test]
@@ -1242,8 +1275,8 @@ async fn terminal_tool_call_cannot_change_completed_arguments() {
     let mock = Mock::new().await;
     let dir = tempfile::tempdir().unwrap();
     let auth = signed_in(&mock, Store::new(dir.path().join("siwc"))).await;
-    let p = provider(auth);
     for stream in [true, false] {
+        let p = provider(auth.clone());
         let mut req = request(stream);
         req.extra.insert(
             "tools".into(),
@@ -1326,32 +1359,35 @@ async fn response_sse_accepts_media_type_parameters_and_missing_header() {
 }
 
 #[tokio::test]
-async fn successful_non_sse_is_protocol_error_with_real_upstream_metadata() {
+async fn successful_http_json_errors_keep_real_error_codes_and_metadata() {
     let mock = Mock::new().await;
     let dir = tempfile::tempdir().unwrap();
     let auth = signed_in(&mock, Store::new(dir.path().join("siwc"))).await;
-    let p = provider(auth);
     for content_type in [Some("application/json; charset=utf-8"), None] {
         mock.data.lock().unwrap().response_content_type = Some(content_type.map(String::from));
         mock.data.lock().unwrap().request_id_header = "x-oai-request-id".into();
         for stream in [true, false] {
+            let p = provider(auth.clone());
             mock.reply(StatusCode::OK, json!({"error":{"code":"subscription_sharing_unsupported_capability","param":"input","message":"unsupported input"}}).to_string());
             let response = p.handle_messages(request(stream), context()).await;
-            assert_eq!(response.status(), 502);
+            assert_eq!(response.status(), 400);
+            assert_eq!(response.headers()["x-should-retry"], "false");
             let error: Value = serde_json::from_str(&body(response).await).unwrap();
-            assert_eq!(error["error"]["code"], "siwc_unexpected_content_type");
+            assert_eq!(
+                error["error"]["code"],
+                "subscription_sharing_unsupported_capability"
+            );
+            assert_eq!(error["error"]["param"], "input");
             assert_eq!(error["upstream_status"], 200);
-            assert_eq!(error["proxy_status"], 502);
+            assert_eq!(error["proxy_status"], 400);
+            assert_eq!(error["response_class"], "json_error");
             assert_eq!(
                 error["upstream_error_code"],
                 "subscription_sharing_unsupported_capability"
             );
             assert_eq!(error["upstream_content_type"], json!(content_type));
             assert_eq!(error["upstream_request_id"], "req_siwc_mock");
-            assert_eq!(
-                error["upstream_body"]["upstream_error"]["error"]["param"],
-                "input"
-            );
+            assert_eq!(error["upstream_body"]["error"]["param"], "input");
         }
     }
 }
@@ -1377,7 +1413,7 @@ async fn response_errors_redact_bearer_and_project_data_from_display_and_diagnos
         assert!(!error.to_string().contains(secret));
         assert!(!error.diagnostics().to_string().contains(secret));
     }
-    assert_eq!(error.diagnostics().as_object().unwrap().len(), 5);
+    assert_eq!(error.diagnostics().as_object().unwrap().len(), 8);
     assert_eq!(
         error.diagnostics()["upstream_error_code"],
         "invalid_request_error"
@@ -1399,8 +1435,8 @@ async fn response_disconnect_and_missing_completion_keep_http_metadata_without_s
     let mock = Mock::new().await;
     let dir = tempfile::tempdir().unwrap();
     let auth = signed_in(&mock, Store::new(dir.path().join("siwc"))).await;
-    let p = provider(auth);
     for disconnect in [false, true] {
+        let p = provider(auth.clone());
         mock.data.lock().unwrap().disconnect_stream = disconnect;
         mock.data.lock().unwrap().request_id_header = "x-oai-request-id".into();
         mock.reply(
@@ -1427,14 +1463,14 @@ async fn missing_content_type_probe_rejects_non_responses_and_oversized_preludes
     let mock = Mock::new().await;
     let dir = tempfile::tempdir().unwrap();
     let auth = signed_in(&mock, Store::new(dir.path().join("siwc"))).await;
-    let p = provider(auth);
     mock.data.lock().unwrap().response_content_type = Some(None);
     for value in [
         String::new(),
         "<html>not SSE</html>".into(),
         event(json!({"type":"unrelated_event"})),
-        format!(":{}\n\n{}", "x".repeat(65 * 1024), text_events()),
+        format!(":{}\n\n{}", "x".repeat(8 * 1024 * 1024 + 1), text_events()),
     ] {
+        let p = provider(auth.clone());
         mock.reply(StatusCode::OK, value);
         let response = p.handle_messages(request(true), context()).await;
         assert_eq!(response.status(), 502);
@@ -1442,4 +1478,246 @@ async fn missing_content_type_probe_rejects_non_responses_and_oversized_preludes
         assert_eq!(error["upstream_status"], 200);
         assert_eq!(error["error"]["code"], "siwc_unexpected_content_type");
     }
+}
+
+fn native_claude_request() -> MessagesRequest {
+    serde_json::from_str(include_str!(
+        "../../../tests/fixtures/siwc/claude-code-2.1.310.json"
+    ))
+    .unwrap()
+}
+
+#[test]
+fn native_claude_request_uses_supported_responses_fields_and_safe_shape_diagnostics() {
+    let mut req = native_claude_request();
+    let prepared = translate::prepare(&req, "gpt-test".into()).unwrap();
+    let wire = &prepared.body;
+    assert_eq!(wire["model"], "gpt-test");
+    assert_eq!(wire["store"], false);
+    assert_eq!(wire["stream"], true);
+    assert!(wire["instructions"].is_string());
+    assert_eq!(wire["input"][0]["type"], "additional_tools");
+    assert_eq!(wire["input"][0]["role"], "developer");
+    let tools = wire["input"][0]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 12);
+    assert!(tools.iter().all(|t| t["type"] == "function"));
+    assert!(
+        wire["input"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["role"] != "system")
+    );
+    for field in [
+        "tools",
+        "metadata",
+        "context_management",
+        "thinking",
+        "output_config",
+        "temperature",
+        "max_tokens",
+        "max_output_tokens",
+        "previous_response_id",
+    ] {
+        assert!(wire.get(field).is_none(), "{field}");
+    }
+    for (choice, expected) in [
+        (json!({"type":"auto"}), json!("auto")),
+        (json!({"type":"none"}), json!("none")),
+        (json!({"type":"any"}), json!("required")),
+        (
+            json!({"type":"tool","name":"Read"}),
+            json!({"type":"function","name":"Read"}),
+        ),
+    ] {
+        req.extra.insert("tool_choice".into(), choice);
+        assert_eq!(
+            translate::prepare(&req, "gpt-test".into()).unwrap().body["tool_choice"],
+            expected
+        );
+    }
+    let mut wire = prepared.body;
+    wire["model"] = json!("private-project-secret-canary");
+    wire["instructions"] = json!("private-project-secret-canary");
+    wire["input"][0]["tools"][0]["name"] = json!("private-project-secret-canary");
+    let shape = translate::request_shape(&wire);
+    assert!(!shape.to_string().contains("private-project-secret-canary"));
+    assert_eq!(shape["system_items"], 0);
+    assert_eq!(shape["tool_count"], 12);
+    assert_eq!(shape["top_level_tools"], false);
+    assert!(shape["model"].is_null());
+}
+
+#[tokio::test]
+async fn missing_type_large_native_response_created_survives_transport_fragmentation() {
+    let mock = Mock::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let auth = signed_in(&mock, Store::new(dir.path().join("siwc"))).await;
+    let p = provider(auth);
+    mock.data.lock().unwrap().response_content_type = Some(None);
+    let mut req = native_claude_request();
+    req.extra.get_mut("system").unwrap()[0]["text"] =
+        json!("Synthetic system size fixture. ".repeat(4000));
+    let wire = translate::prepare(&req, "gpt-test".into()).unwrap().body;
+    let created = event(
+        json!({"type":"response.created","response":{"id":"resp_fixture","status":"in_progress","instructions":wire["instructions"],"tools":wire["input"][0]["tools"]}}),
+    );
+    assert!(created.len() > 64 * 1024);
+    for chunk_bytes in [None, Some(127), Some(64 * 1024)] {
+        mock.data.lock().unwrap().response_chunk_bytes = chunk_bytes;
+        for stream in [true, false] {
+            req.stream = stream;
+            mock.reply(StatusCode::OK, format!("{created}{}", text_events()));
+            let response = p.handle_messages(req.clone(), context()).await;
+            assert_eq!(response.status(), 200);
+            let text = body(response).await;
+            assert!(text.contains("你好"));
+            assert!(!text.contains("siwc_unexpected_content_type"));
+            assert_eq!(text.contains("message_stop"), stream);
+        }
+    }
+    assert_eq!(mock.count("/v1/responses"), 6);
+}
+
+#[tokio::test]
+async fn missing_type_sse_does_not_drop_events_after_the_first_frame_in_a_chunk() {
+    let mock = Mock::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let auth = signed_in(&mock, Store::new(dir.path().join("siwc"))).await;
+    let p = provider(auth);
+    mock.data.lock().unwrap().response_content_type = Some(None);
+    let delta = event(
+        json!({"type":"response.output_text.delta","output_index":0,"content_index":0,"delta":"x"}),
+    );
+    let events = format!(
+        "{}{}{}{}{}",
+        event(json!({"type":"response.created","response":{"id":"resp_fixture"}})),
+        event(
+            json!({"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"item_text","role":"assistant","content":[]}})
+        ),
+        delta.repeat(2048),
+        event(
+            json!({"type":"response.output_item.done","output_index":0,"item":{"type":"message","id":"item_text","content":[{"type":"output_text","text":"x".repeat(2048)}]}})
+        ),
+        event(
+            json!({"type":"response.completed","response":{"id":"resp_fixture","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"x".repeat(2048)}]}],"usage":{"input_tokens":1,"output_tokens":2048}}})
+        )
+    );
+    assert!(events.len() > 64 * 1024);
+    mock.reply(StatusCode::OK, events);
+    let response = p.handle_messages(request(false), context()).await;
+    assert_eq!(response.status(), 200);
+    let message: Value = serde_json::from_str(&body(response).await).unwrap();
+    assert_eq!(message["content"][0]["text"], "x".repeat(2048));
+}
+
+#[tokio::test]
+async fn missing_type_valid_sse_can_start_after_ten_seconds() {
+    let mock = Mock::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let auth = signed_in(&mock, Store::new(dir.path().join("siwc"))).await;
+    let p = provider(auth);
+    {
+        let mut data = mock.data.lock().unwrap();
+        data.response_content_type = Some(None);
+        data.response_chunk_bytes = Some(1024);
+        data.initial_stream_delay = std::time::Duration::from_secs(11);
+    }
+    mock.reply(StatusCode::OK, text_events());
+    let response = p.handle_messages(request(false), context()).await;
+    assert_eq!(response.status(), 200);
+    assert!(body(response).await.contains("你好"));
+}
+
+#[tokio::test]
+async fn successful_http_non_sse_is_classified_and_json_error_codes_are_preserved() {
+    let mock = Mock::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let auth = signed_in(&mock, Store::new(dir.path().join("siwc"))).await;
+    for (raw, status, code, class) in [
+        (json!({"object":"response","status":"completed"}).to_string(), 502, "siwc_unexpected_content_type", "json"),
+        ("<html>failure</html>".into(), 502, "siwc_unexpected_content_type", "html_or_xml"),
+        (String::new(), 502, "siwc_unexpected_content_type", "empty"),
+        (json!({"error":{"code":"invalid_request_error","param":"input","message":"invalid input"}}).to_string(), 400, "invalid_request_error", "json_error"),
+        (json!({"error":{"code":"subscription_sharing_invalid_user","param":"input","message":"invalid identity"}}).to_string(), 401, "subscription_sharing_invalid_user", "json_error"),
+        (json!({"error":{"code":"subscription_sharing_user_not_eligible","param":"input","message":"ineligible"}}).to_string(), 403, "subscription_sharing_user_not_eligible", "json_error"),
+        (json!({"error":{"code":"subscription_sharing_usage_limit_exceeded","param":"input","message":"limit"}}).to_string(), 429, "subscription_sharing_usage_limit_exceeded", "json_error"),
+        (json!({"error":{"code":"future_unknown_error","param":"input","message":"refused"}}).to_string(), 502, "future_unknown_error", "json_error"),
+    ] {
+        mock.data.lock().unwrap().response_content_type = Some(None);
+        mock.reply(StatusCode::OK, raw);
+        let p = provider(auth.clone());
+        let response = p.handle_messages(request(true), context()).await;
+        assert_eq!(response.status().as_u16(), status);
+        assert_eq!(response.headers()["x-should-retry"], "false");
+        let error: Value = serde_json::from_str(&body(response).await).unwrap();
+        assert_eq!(error["error"]["code"], code);
+        assert_eq!(error["response_class"], class);
+        assert_eq!(error["upstream_status"], 200);
+        assert_eq!(error["proxy_status"], status);
+        if class == "json_error" {
+            assert_eq!(error["error"]["param"], "input");
+        }
+        if status == 429 {
+            let response = p.handle_messages(request(true), context()).await;
+            assert_eq!(response.status(), 429); // Paused locally, no extra mock reply.
+        }
+    }
+    assert_eq!(mock.count("/v1/responses"), 8);
+}
+
+#[tokio::test]
+async fn first_event_diagnostics_do_not_echo_untrusted_event_type() {
+    let mock = Mock::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let auth = signed_in(&mock, Store::new(dir.path().join("siwc"))).await;
+    mock.data.lock().unwrap().response_content_type = Some(None);
+    mock.reply(
+        StatusCode::OK,
+        event(json!({"type":"response.private-project-secret-canary"})),
+    );
+    let text = body(
+        provider(auth)
+            .handle_messages(request(true), context())
+            .await,
+    )
+    .await;
+    assert!(text.contains("other_event"));
+    assert!(!text.contains("private-project-secret-canary"));
+    assert!(!text.contains("message_stop"));
+}
+
+#[tokio::test]
+async fn native_stream_to_buffered_fallback_is_blocked_after_ambiguous_failure() {
+    let mock = Mock::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let auth = signed_in(&mock, Store::new(dir.path().join("siwc"))).await;
+    let p = provider(auth);
+    mock.data.lock().unwrap().response_content_type = Some(None);
+    mock.reply(StatusCode::OK, format!("{}{}", event(json!({"type":"response.created","response":{"id":"resp_failure"}})), event(json!({"type":"response.failed","response":{"error":{"code":"server_is_overloaded","param":"model","message":"temporarily overloaded"}}}))));
+    let mut req = native_claude_request();
+    req.stream = true;
+    let response = p.handle_messages(req.clone(), context()).await;
+    assert_eq!(response.headers()["x-should-retry"], "false");
+    let text = body(response).await;
+    assert!(text.contains("server_is_overloaded"));
+    assert!(!text.contains("message_stop"));
+    req.stream = false;
+    let response = p.handle_messages(req.clone(), context()).await;
+    assert_eq!(response.status(), 503);
+    assert_eq!(response.headers()["x-siwc-replay-blocked"], "true");
+    assert_eq!(response.headers()["x-should-retry"], "false");
+    let error: Value = serde_json::from_str(&body(response).await).unwrap();
+    assert_eq!(error["error"]["code"], "server_is_overloaded");
+    assert_eq!(error["error"]["param"], "model");
+    assert_eq!(error["upstream_status"], 200);
+    assert_eq!(error["upstream_request_id"], "req_siwc_mock");
+    assert_eq!(error["upstream_body"]["replay_blocked"], true);
+    assert_eq!(mock.count("/v1/responses"), 1);
+    req.messages[0].content = json!("A changed user request");
+    mock.reply(StatusCode::OK, text_events());
+    let response = p.handle_messages(req, context()).await;
+    assert_eq!(response.status(), 200);
+    assert!(body(response).await.contains("你好"));
+    assert_eq!(mock.count("/v1/responses"), 2);
 }

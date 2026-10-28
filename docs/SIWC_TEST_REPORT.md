@@ -1,6 +1,6 @@
 # SIWC 测试与交付报告
 
-日期：2026-10-27（America/Los_Angeles）。基础提交：`a08de6a`；分支：`feat/official-chatgpt-oauth`。交付提交通过 `git log -1 --oneline` 查看。代码只在本地提交，未推送远端、未创建 PR。
+首次交付日期：2026-10-27；最新验收：2026-10-28（America/Los_Angeles）。基础提交：`a08de6a`；分支：`feat/official-chatgpt-oauth`。交付提交通过 `git log -1 --oneline` 查看。代码只在本地提交，未推送远端、未创建 PR。
 
 首次交付提交为 `2f5fe50`。本报告保留首次交付记录，最新的响应处理修复和真实复测见最后一节。
 
@@ -137,3 +137,66 @@ OAuth、凭据存储、端点和请求转换器未修改。凭据文件校验确
 真实 OAuth 为用户已完成的授权，本次复用验证；没有重做浏览器登录。Claude Code 实际 Read/Write/Bash/MCP、长会话压缩和 `/resume` 仍待人工验证。单次文本请求完成也不能保证全部模型或工具能力可用。
 
 本次核对的最新官方文档：[模型与推理](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference)、[错误与恢复](https://developers.openai.com/siwc/token-sharing-open-source/errors-and-recovery)、[预览限制](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations)。
+
+## 原生 Claude Code 兼容修复与验收（2026-10-28）
+
+本节记录基于 `fc6441f` 的后续修复；上面的测试数量、二进制摘要和待验项目均为各次交付时的历史记录。
+
+### 真实复现及根因
+
+使用已安装的原生 Claude Code **2.1.310**，在临时空项目和独立 Claude 配置目录中运行 `claude -p`，复用现有 SIWC default profile 和 `gpt-6.1-sol`。没有加载用户项目文件、Hooks、MCP 或历史。
+
+- 普通原生文本请求包含 12 个 custom 工具、system 文本块及一条 system-role 消息，已能返回 `CLAUDE GPT OK`。
+- 增加无敏感内容的 system 长度后，原生请求为 138,207 字节。修复前在收到 65,554 字节时命中旧探测的 64 KiB 上限，返回 HTTP 502；实际上游 HTTP 200、Content-Type 缺失，请求 ID 为 `req_564030734a0f4f07bc40e14960ba5a14`。
+- 修改后，同样请求完成真实推理。安全诊断确认首事件为 `response.created`，完整首帧 **130,366 字节**，其中包含上游回显的 instructions 和工具定义。旧上限小于合法首事件，是本次复现的直接根因。旧 10 秒首帧期限也过短，本次改为 90 秒并增加延迟首帧回归；本次大小复现约 4 秒即失败，并非超时。
+- 用户提供的两个历史 Request ID 没有配套正文或长度记录，无法事后从本地诊断还原其首帧大小；没有将新复现冒充为对这两个历史响应的逐字节检查。
+
+### 请求结构对比
+
+| 官方 Responses 字段 | 最小 curl | 实际原生 Claude Code 转换后 |
+| --- | --- | --- |
+| model | 官方可见 slug | 同为 `gpt-6.1-sol` |
+| store / stream | false / true | false / true；入站非流式也向官方使用 true |
+| input | 完整用户消息 | 完整客户端历史；system-role 消息转 developer；函数定义作为 developer additional_tools |
+| instructions | 无 | 顶层 system 文本块合并；大请求实测 97,041 字节 |
+| tools | 无 | 12 个本地 custom 工具映射为 function，位于 additional_tools；不生成顶层 tools 或 hosted tool_search |
+| tool_choice | 无 | 实际文本请求省略；Mock 验证 auto/none/any/具名工具转换 |
+| 其他字段 | parallel_tool_calls | 相同；不透传 max_tokens、metadata、thinking、context_management 等 Anthropic 字段 |
+
+转换后的大请求为 138,816 字节、3 个 input 项、12 个函数工具，`system_items=0`、`top_level_tools=false`。没有通过移除 Claude Code 核心工具或丢弃 system 来规避故障。原生工具名 ToolSearch 在此是普通本地函数；代理没有生成官方不支持的 Responses `type: tool_search`。
+
+### 实现与重试行为
+
+- `stream.rs`：按完整 SSE 首事件验证，大小上限与普通帧的 **8 MiB** 一致，首帧期限 **90 秒**；按行增量解码，保留当前 HTTP 分块中首事件之后的字节。正常/charset/缺头 SSE 均支持，BOM、CRLF 和 UTF-8 分片有回归；JSON/HTML/空响应仍失败，只有 `response.completed` 才成功。
+- `client.rs`：状态优先；HTTP 200 JSON error 保留真实 code/param 并按已知代码分类，未知错误码也保留。增加 `response_class`、`first_event_type`（固定安全类别）和 `probe_bytes`。诊断不记录正文、提示词、Authorization、工具名称或参数。
+- `translate.rs`：增加固定类别、数量和字节数的 `siwc_request_shape` 诊断，不改变现有请求白名单和工具转换。
+- `client.rs` / `stream.rs`：推理 POST 不自动重放；错误和流响应添加 `x-should-retry: false`。真实测试发现 Claude Code 遇到流内 `server_is_overloaded` 后会改为非流式重发，单靠响应头无法阻止。现在同一转换后请求失败后，在当前进程内缓存安全错误 **60 秒、最多 16 项**，拦截回退并返回原错误及 Request ID；仅使用不落盘、不输出的 SHA-256 索引。改变请求后可继续。缓存不覆盖并发在途请求、其他进程或时限/容量之外的请求，不承诺恰好一次工具执行。
+- `tests.rs` 和脱敏原生 fixture：新增 7 项测试，包含真实原生请求形状、大于 64 KiB 的 response.created、多种 HTTP 分片、同块剩余事件、11 秒延迟首帧、异常 200 分类、诊断脱敏、流式到非流式回退拦截；保留既有 400/401/403/429、断流、缺少完成事件测试。
+
+原生请求 fixture 为 `tests/fixtures/siwc/claude-code-2.1.310.json`，来源与脱敏说明在同目录 README；根目录 README、使用指南及兼容性表同步更新了实测范围和重试行为。
+
+本次修改没有改变 OAuth、Client ID、Host ID、凭据格式或官方端点。授权正常刷新按原流程进行；没有重新注册、注销、删除账号或调用私有推理端点。未修改用户原有 Claude Code 项目或历史。
+
+### 最终验证
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo fmt --check` | 通过 |
+| `cargo clippy --all-targets -- -D warnings` | 通过 |
+| SIWC 模块测试 | 47 passed / 0 failed |
+| `cargo test` | 1187 passed / 0 failed / 0 ignored，15 组测试 |
+| `cargo build --release --locked` | 通过，Mach-O arm64 Release |
+| 最终 Release 原生 Claude Code 文本 | 通过：大 system / 12 工具的请求返回 CLAUDE GPT OK，退出码 0，上游仅一次推理 |
+| 最终 Release 原生 Read / Write / Bash | 通过：三个实际工具调用、四轮推理均完成，工具结果无 is_error；输出文件逐字匹配输入，Bash 返回 BASH VERIFIED，最终为 CLAUDE TOOLS OK，退出码 0 |
+
+最终二进制 SHA-256：`7a7839114332e0a72363d474635a5e7c0d0d910414e2af3a0bef66d802816e75`；最终完整检查后摘要与实机验证使用的文件相同。
+
+最终文本 Request ID 为 `req_e942eac71ce448978824f041c7d83ce5`，首事件为 response.created、130,366 字节。工具链四轮 ID 依次为 `req_e747598baa3a431bbb3bfc34d3eb96b5`、`req_2ed0e91d94624ac19600fa4e9e0b55b2`、`req_b425e1b8014444eaaf61cd9c86eaa67a`、`req_64fbc213de384f08a43d6f7ba6dac1d5`。各轮实际上游均为 HTTP 200、Content-Type 缺失；对应函数调用和结果累计数为 0、1、2、3，所有轮次均完成，没有失败回退或重复转发。最终答复分别严格匹配上述文本。
+
+测试过程中原 Access Token 到期，由现有 OAuth 刷新流程正常续期，因此凭据文件摘要发生预期变化。刷新前后 Client ID 和 Host ID 摘要相同、账号凭据仍存在；没有重新注册或删除账号。每次验收使用临时回环端口、独立 Claude 配置和 `--no-session-persistence`，自建进程结束后均已退出，用户原有代理进程未被停止。
+
+原生 SDK 本地错误实验（不调用官方 API）：带 `x-should-retry: false` 的 502/503 各产生一次 POST；400 仍观察到两次 POST，说明客户端应用层也可能另外发请求。Mock 回归验证流式失败后的非流式请求命中同一上游请求摘要，官方 mock 计数保持 1，并保留首次错误代码、param、200 上游状态及 Request ID。
+
+完整交互式 UI、真实 MCP/Skills/Hooks/Subagents、长会话 `/compact` 与原项目 `/resume` 仍未验收。临时目录的原生文本和工具验证不等于这些能力全部通过。
+
+官方依据：[预览限制](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations)、[模型与推理](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference)、[错误与恢复](https://developers.openai.com/siwc/token-sharing-open-source/errors-and-recovery)。

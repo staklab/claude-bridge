@@ -1,6 +1,6 @@
 # SIWC 兼容性与安全边界
 
-本页描述代理行为及验证范围。已复用真实 OAuth 授权，通过本地 `/v1/messages` 验证 `gpt-6.1-sol` 基础文本流式和非流式推理。Claude Code UI、编程工具、长会话压缩与 `/resume` 仍待人工验证；其他模型的权限需逐次由官方 API 判定。
+本页描述代理行为及验证范围。已复用真实 OAuth，通过最终 Release 在临时项目验证原生 Claude Code 2.1.310 的 `gpt-6.1-sol` 文本和 Read/Write/Bash 调用。完整交互 UI、MCP、长会话压缩与 `/resume` 仍待人工验证；其他模型的权限需逐次由官方 API 判定。
 
 ## 能力矩阵
 
@@ -8,7 +8,7 @@
 | --- | --- |
 | Anthropic `/v1/messages` 文本 | 流式翻译；非流式调用也向官方发送 stream=true，完成后本地合并。 |
 | 多轮历史、代理重启 | 每次转换客户端提供的完整历史；无服务端 previous_response_id、代理历史数据库。Mock 覆盖实例重建后输入一致性。 |
-| Read/Write/Bash | 转为 function call，保留 call_id，结果回传；执行由 Claude Code 完成，代理不会执行 Shell 或文件操作。实际工具交互待验证。 |
+| Read/Write/Bash | 转为 function call，保留 call_id，结果回传；执行由 Claude Code 完成。已在隔离临时项目实测三种工具，写入文件内容及 Bash 校验均通过。 |
 | 本地 MCP | 普通函数定义及文本/base64 图片结果可转换；建议 ENABLE_TOOL_SEARCH=false，所有工具定义提前加载。 |
 | Skills/Hooks/Subagents | 保持客户端原流程，普通消息/函数经 SIWC 转发；未进行真实客户端验收，不能保证所有新 beta 功能。 |
 | `/resume` | 不修改 `~/.claude/projects/`。需要 Claude Code 重发历史；真实历史恢复待人工测试。 |
@@ -26,7 +26,7 @@
 | Responses 原生入站、Chat Completions、WebSocket | SIWC 进程不挂载这些路由。它接受 Anthropic Messages 并通过官方 HTTP Responses 输出推理请求。 |
 | beta 服务端 threads | 客户端要求服务器持久线程时仍明确 capability_rejected，不能取代完整本地历史。 |
 
-复用的上游转换器会清除函数 schema 的 pattern 约束，并沿用其 Read 参数/说明修正逻辑。客户端应继续负责工具输入校验和权限。转换器对巨大 Read offset 的原有修正仍可能改变异常工具参数；真实 Read 验收需要检查。SIWC 专门关闭了 Read 空白停滞时提前结束响应的修复逻辑，始终等待官方完成事件；终止事件中的工具 ID、名称和参数必须与此前完成的调用一致。
+复用的上游转换器会清除函数 schema 的 pattern 约束，并沿用其 Read 参数/说明修正逻辑。客户端应继续负责工具输入校验和权限。转换器对巨大 Read offset 的原有修正仍可能改变异常工具参数；本次基础 Read 实测不涵盖这类边界。SIWC 专门关闭了 Read 空白停滞时提前结束响应的修复逻辑，始终等待官方完成事件；终止事件中的工具 ID、名称和参数必须与此前完成的调用一致。
 
 ## 参数约定
 
@@ -47,9 +47,9 @@ Anthropic 的 max_tokens、temperature、top_p、top_k、metadata、stop_sequenc
 - OAuth 与 API 均关闭重定向、验证 TLS；生产端点不提供环境覆盖。Mock 地址只能在测试模块内构造。
 - 不保存请求/响应流量；不会把授权 URL 中的 ID Token hint 输出到日志。错误正文交给客户端，代理日志不写入 SIWC 上游错误内容。CLI status 不显示 Token。
 - 初次 HTTP 失败保留状态、JSON body 形状、code/param、请求 ID，局部脱敏 bearer 回显；未知非 JSON 错误返回通用说明。SSE 失败保留结构化错误及请求 ID。
-- 先判断 HTTP 状态，再判断 SSE 类型；带 charset 的媒体类型可用。缺少 Content-Type 时只在 10 秒、64 KiB 内确认 Responses SSE 首帧后继续；显式 JSON/HTML 或无法确认的成功响应返回 `siwc_unexpected_content_type`。`upstream_status` 保留实际状态，`proxy_status` 单列代理错误分类。诊断日志使用字段白名单，不记录错误正文或项目内容。
+- 先判断 HTTP 状态，再判断 SSE 类型；带 charset 的媒体类型可用。缺少 Content-Type 时在 90 秒、8 MiB 内验证完整 Responses SSE 首事件，保留当前分块中的后续事件。普通 JSON/HTML 或无法确认的成功响应返回协议错误；JSON error 保留 code/param，按已知错误代码分类，不一律写成 502。`upstream_status` 保留实际状态，`proxy_status` 单列代理分类。日志仅记录安全分类、首事件类型和结构计数。
 - 只有 response.completed 成功；response.failed/incomplete、无完成事件、网络中断和工具关联异常都返回错误。不在流内重放请求。
-- HTTP 503 明确临时错误最多两次退避；429 不自动重试，套餐额度错误使该代理进程暂停新推理，用户确认额度恢复后再重启。
+- 推理 POST 不自动重放；模型目录 GET 保留有限退避。错误和流响应发送 `x-should-retry: false`。由于 Claude Code 仍可能从流式切换为非流式重发，同一转换后请求失败后在当前进程内拦截 60 秒（最多 16 项），返回首次错误，不再次消费上游推理。该缓存不覆盖并发在途请求或其他进程。429 套餐额度错误仍暂停新推理，用户确认恢复后再重启。
 - 流式 HTTP 状态在开始后不可改变；错误通过 Anthropic error 事件送达，监控使用单独结果标记，不能仅凭 HTTP 200 判断成功。
 
 官方支持的是符合要求的 OSS/本地应用授权和指定预览 API。这并不保证所有账号、工作区、地区、模型或请求能力可用，也不意味着零账号风险。用户授权、套餐设置、服务政策和后续协议变化仍决定实际访问范围。

@@ -46,8 +46,9 @@ cargo build --release --locked
 ```
 
 The user completes authorization in their browser. No paid API key is required.
-Text inference through `/v1/messages` has been verified with an existing real
-OAuth grant. Claude Code tools and history integration remain **pending manual verification**.
+Native Claude Code 2.1.310 text inference and Read/Write/Bash have been verified
+in an isolated test project with an existing real OAuth grant. MCP and long-session
+history integration remain **pending manual verification**.
 See the [SIWC usage guide](docs/SIWC_USAGE.md),
 [compatibility and security limits](docs/SIWC_COMPATIBILITY.md),
 [implementation plan](docs/SIWC_IMPLEMENTATION_PLAN.md), and

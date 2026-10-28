@@ -1,6 +1,6 @@
 # 官方 SIWC 使用指南
 
-本分支新增独立的 `siwc` 模式。已复用用户现有真实 OAuth 授权，通过新 Release 的本地 `/v1/messages` 完成 `gpt-6.1-sol` 基础文本流式及非流式验证；Claude Code 实际工具和历史恢复仍**待人工验证**。这不代表所有账号和模型均有使用资格。当前支持 macOS/Linux 的私有文件凭据，主要构建目标为 macOS Apple Silicon。
+本分支新增独立的 `siwc` 模式。已复用现有真实 OAuth，在隔离临时项目中通过新 Release 验证原生 Claude Code 2.1.310 的 `gpt-6.1-sol` 文本对话及 Read/Write/Bash 调用；长会话恢复和真实 MCP 等仍**待人工验证**。这不代表所有账号和模型均有使用资格。当前支持 macOS/Linux 的私有文件凭据，主要构建目标为 macOS Apple Silicon。
 
 ## 1. 构建
 
@@ -155,17 +155,20 @@ claude --resume
 | HTTP 401 | 检查所选账号、授权 scope；不会借机自动改用另一账号或 API Key。 |
 | HTTP 403 | 检查用户/工作区/地区/政策限制及精确 error.code。 |
 | HTTP 429 / usage_limit_exceeded | 该代理进程暂停后续推理；查看 [Usage](https://chatgpt.com/settings/usage)。额度恢复后由用户重启同账号代理；不要自动轮换账号。 |
-| HTTP 503 | 对明确临时错误最多请求三次；Retry-After 超过 5 秒则立即返回，让用户稍后再试。 |
+| HTTP 503 | 推理 POST 不自动重放；模型目录 GET 保留有限退避。保留真实错误，稍后由用户决定是否重试。 |
 | model_not_found / 模型不可用 | 重新运行该 profile 的 `siwc models`，选择模型并实际验证；目录不保证资格。 |
 | siwc_stream_error | 网络中断、缺少完成事件、无效工具关联等均失败；保留客户端历史后人工决定重试，避免重复工具副作用。 |
-| siwc_unexpected_content_type | 查看 `upstream_status`、`upstream_content_type`、`upstream_request_id` 和 `upstream_error_code`。成功 HTTP 返回 JSON/HTML 等内容时，本地返回 502；真实上游状态仍单独保留，例如 200。 |
-| siwc_sse_content_type_missing 日志 | 当前链路缺少 Content-Type，但在 10 秒、64 KiB 内验证了 Responses SSE 首帧；这是诊断提示，仍须等待最终完成事件。无法通过探测的响应会报协议错误。 |
+| siwc_unexpected_content_type | 查看状态、Request ID、`response_class` 和 `probe_bytes`。成功 HTTP 返回普通 JSON/HTML 等内容时，本地返回协议错误；真实上游状态仍单独保留，例如 200。有结构化 error 的 JSON 保留真实 code/param，并按已知代码分类为 400/401/403/429/503 等；未知代码保留且本地使用 502。 |
+| siwc_response_classification 日志 | `responses_sse` 表示已验证 Responses 首事件，`first_event_type` 使用安全类别；其他类别包括 json/json_error、html_or_xml、empty、probe_limit、probe_timeout、transport_error 等。缺头探测上限为 90 秒、8 MiB，大小对应完整首事件而非 HTTP 分块。合法流仍必须等到 response.completed。 |
+| siwc_replay_blocked 日志 / x-siwc-replay-blocked: true | 同一转换后请求失败后，60 秒内的重发被本地拦截，返回首次错误及 Request ID。Claude Code 可能在流失败后改用非流式重发；该拦截避免再次调用官方 API。失败缓存最多 16 项，仅存于当前进程；有效请求成功后可以正常重复。 |
 | unsupported tool/content | 参考兼容性表；关闭动态 tool search，使用本地 function tools。 |
 | 本地 403 | 仅支持回环 CLI 请求；检查 Host、Origin、监听地址。 |
 | 凭据权限错误 | 检查 siwc 目录 0700、其中普通文件 0600，不能是 symlink/hardlink；不要放宽权限。 |
 
 本地文件：`<CCP_CONFIG_DIR>/siwc/state.json`、`state.lock`；默认是 `~/.config/claude-code-proxy/siwc/`。不要上传这些文件。本实现未启用 Keychain，不应将凭据目录共享或同步到不受信任的设备。
 
-响应诊断中的 `upstream_status` 表示实际收到的上游 HTTP 状态，`proxy_status` 表示代理错误分类；已经开始的 HTTP 200 流可通过 error 事件报告失败。请求 ID 兼容 `x-request-id`、`x-oai-request-id` 和 `x-openai-request-id`，本地响应使用 `x-openai-request-id` 转交。日志只保存状态、Content-Type、Request ID 和经过筛选的错误代码，不保存错误消息、Authorization 或完整请求。转交客户端的错误信息也会脱敏凭据和可识别的请求文本回显。
+响应诊断中的 `upstream_status` 表示实际收到的上游 HTTP 状态，`proxy_status` 表示代理错误分类；已经开始的 HTTP 200 流可通过 error 事件报告失败。请求 ID 兼容 `x-request-id`、`x-oai-request-id` 和 `x-openai-request-id`，本地响应使用 `x-openai-request-id` 转交。日志只保存状态、Content-Type、Request ID、安全错误代码、响应分类和首事件类型/字节数；`siwc_request_shape` 另记录模型、固定标志、角色/工具数量及长度，不记录提示词、工具名称或参数。转交客户端的错误信息也会脱敏凭据和可识别的请求文本回显。
+
+错误响应及流响应包含 `x-should-retry: false`，但这不能控制客户端自己的流式到非流式回退。失败拦截使用转换后请求的 SHA-256（不落盘、不输出摘要），因此两种入站 stream 模式会匹配同一上游请求。它不是持久去重或恰好一次执行保证：并发在途请求、其他代理进程、超过缓存时限/容量后的重发仍可能调用上游。收到部分工具调用或断流后，先检查客户端工具是否已执行，再决定重试。
 
 Claude Code 配置依据：[模型配置](https://code.claude.com/docs/en/model-config)、[环境变量](https://code.claude.com/docs/en/env-vars)、[工作流程与恢复](https://code.claude.com/docs/en/common-workflows)。

@@ -5,13 +5,52 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde_json::{Value, json};
-use std::time::Duration;
+use sha2::{Digest, Sha256};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+type FailureCache = Arc<Mutex<VecDeque<(Instant, [u8; 32], ApiError)>>>;
+
+#[derive(Clone)]
+struct ReplayGuard {
+    failures: FailureCache,
+    key: [u8; 32],
+}
+impl ReplayGuard {
+    fn cached(&self) -> Option<ApiError> {
+        let mut failures = self.failures.lock().expect("SIWC replay guard");
+        failures.retain(|(at, _, _)| at.elapsed() < Duration::from_secs(60));
+        failures
+            .iter()
+            .rev()
+            .find(|(_, key, _)| key == &self.key)
+            .map(|(_, _, error)| {
+                let mut error = error.clone();
+                error.body["replay_blocked"] = json!(true);
+                error
+            })
+    }
+    fn remember(&self, error: &ApiError) {
+        let mut failures = self.failures.lock().expect("SIWC replay guard");
+        failures.retain(|(_, key, _)| key != &self.key);
+        if failures.len() >= 16 {
+            failures.pop_front();
+        }
+        failures.push_back((Instant::now(), self.key, error.clone()));
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(super) struct ResponseInfo {
     pub status: StatusCode,
     pub content_type: Option<String>,
     pub request_id: Option<String>,
+    pub response_class: Option<&'static str>,
+    pub first_event_type: Option<&'static str>,
+    pub probe_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -19,6 +58,7 @@ pub(super) struct ResponseContext {
     pub info: ResponseInfo,
     token: String,
     redactions: Vec<String>,
+    replay: Option<ReplayGuard>,
 }
 
 impl ResponseContext {
@@ -36,9 +76,13 @@ impl ResponseContext {
                 status: response.status(),
                 content_type: None,
                 request_id: None,
+                response_class: None,
+                first_event_type: None,
+                probe_bytes: 0,
             },
             token: token.to_string(),
             redactions,
+            replay: None,
         };
         context.info.content_type = response
             .headers()
@@ -141,13 +185,48 @@ impl ResponseContext {
     }
 
     pub fn unexpected_type(&self, body: Value) -> ApiError {
+        if let Some(error) = body.get("error").filter(|e| e.is_object()) {
+            let mut result = self.http_error(json!({"error":error}));
+            result.status = response_error_status(error["code"].as_str().unwrap_or(""));
+            self.remember_failure(&result);
+            return result;
+        }
         let mut error = ApiError::local(
             StatusCode::BAD_GATEWAY,
             "siwc_unexpected_content_type",
             "Responses API returned a successful HTTP status without a valid SSE stream",
         );
         error.body["upstream_error"] = self.sanitize(body);
-        error.with_upstream(&self.info)
+        let error = error.with_upstream(&self.info);
+        self.remember_failure(&error);
+        error
+    }
+    pub fn remember_failure(&self, error: &ApiError) {
+        if let Some(replay) = &self.replay {
+            replay.remember(error);
+        }
+    }
+}
+
+pub(super) fn response_error_status(code: &str) -> StatusCode {
+    match code {
+        "subscription_sharing_unsupported_capability" | "invalid_request_error" => {
+            StatusCode::BAD_REQUEST
+        }
+        "subscription_sharing_invalid_user" | "invalid_api_key" => StatusCode::UNAUTHORIZED,
+        "subscription_sharing_user_not_eligible"
+        | "subscription_sharing_route_not_supported"
+        | "chatpass_v2_scope_not_authorized"
+        | "chatpass_v2_invalid_authorization_context"
+        | "permission_denied" => StatusCode::FORBIDDEN,
+        "model_not_found" => StatusCode::NOT_FOUND,
+        "subscription_sharing_usage_limit_exceeded"
+        | "rate_limit_exceeded"
+        | "insufficient_quota" => StatusCode::TOO_MANY_REQUESTS,
+        "subscription_sharing_usage_unavailable"
+        | "subscription_sharing_user_unavailable"
+        | "server_is_overloaded" => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::BAD_GATEWAY,
     }
 }
 
@@ -204,7 +283,8 @@ impl ApiError {
             .or_else(|| self.body.pointer("/error/code"))
             .and_then(Value::as_str);
         let safe_code = code.filter(|s| {
-            s.len() <= 128
+            !s.is_empty()
+                && s.len() <= 128
                 && !s.starts_with("sk-")
                 && s.bytes().all(|b| {
                     b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-' | b'.')
@@ -213,6 +293,9 @@ impl ApiError {
         json!({"upstream_status":self.upstream.as_ref().map(|u| u.status.as_u16()),
             "upstream_content_type":self.upstream.as_ref().and_then(|u| u.content_type.as_deref()),
             "upstream_request_id":self.request_id,"upstream_error_code":safe_code,
+            "response_class":self.upstream.as_ref().and_then(|u| u.response_class),
+            "first_event_type":self.upstream.as_ref().and_then(|u| u.first_event_type),
+            "probe_bytes":self.upstream.as_ref().map(|u| u.probe_bytes),
             "proxy_status":self.status.as_u16()})
     }
     pub fn report(&self) {
@@ -246,6 +329,15 @@ impl ApiError {
     }
     pub fn response(&self) -> Response {
         let mut response = (self.status, Json(self.envelope())).into_response();
+        response
+            .headers_mut()
+            .insert("x-should-retry", "false".parse().expect("static header"));
+        if self.body["replay_blocked"] == true {
+            response.headers_mut().insert(
+                "x-siwc-replay-blocked",
+                "true".parse().expect("static header"),
+            );
+        }
         for (key, value) in [
             ("x-openai-request-id", &self.request_id),
             ("retry-after", &self.retry_after),
@@ -280,6 +372,7 @@ pub(super) struct Client {
     pub auth: Auth,
     http: reqwest::Client,
     pub usage_pause: std::sync::Arc<std::sync::Mutex<Option<ApiError>>>,
+    failures: FailureCache,
 }
 
 impl Client {
@@ -288,6 +381,7 @@ impl Client {
             auth,
             http: http_client(),
             usage_pause: Default::default(),
+            failures: Default::default(),
         }
     }
     async fn request(&self, body: Option<&Value>) -> Result<reqwest::Response, ApiError> {
@@ -303,6 +397,17 @@ impl Client {
                 &e.to_string(),
             )
         })?;
+        let replay = body.map(|body| ReplayGuard {
+            failures: self.failures.clone(),
+            key: Sha256::digest(body.to_string().as_bytes()).into(),
+        });
+        if let Some(error) = replay.as_ref().and_then(ReplayGuard::cached) {
+            crate::logging::create_logger("siwc").warn(
+                "siwc_replay_blocked",
+                error.diagnostics().as_object().cloned(),
+            );
+            return Err(error);
+        }
         for attempt in 0..3 {
             if body.is_some()
                 && let Some(error) = self.usage_pause.lock().expect("usage pause").clone()
@@ -328,13 +433,18 @@ impl Client {
                 tokio::time::timeout(Duration::from_secs(60), request.bearer_auth(&token).send())
                     .await;
             let mut response = result.ok().and_then(Result::ok).ok_or_else(|| {
-                ApiError::local(
+                let error = ApiError::local(
                     StatusCode::BAD_GATEWAY,
                     "siwc_network_error",
                     "SIWC request failed or timed out before headers; no automatic replay",
-                )
+                );
+                if let Some(replay) = &replay {
+                    replay.remember(&error);
+                }
+                error
             })?;
-            let context = ResponseContext::new(&response, &token, body);
+            let mut context = ResponseContext::new(&response, &token, body);
+            context.replay = replay.clone();
             if response.status().is_success() {
                 response.extensions_mut().insert(context);
                 return Ok(response);
@@ -353,8 +463,14 @@ impl Client {
                     || json!({"detail":"Upstream returned an unreadable error response"}),
                 );
             let mut error = context.http_error(raw);
+            if let Some(info) = error.upstream.as_mut() {
+                info.response_class = Some("http_error");
+            }
             error.retry_after = retry_after;
             error.report();
+            if let Some(replay) = &replay {
+                replay.remember(&error);
+            }
             if error.body.pointer("/error/code").and_then(Value::as_str)
                 == Some("subscription_sharing_usage_limit_exceeded")
             {
@@ -371,7 +487,9 @@ impl Client {
                     "" | "subscription_sharing_usage_unavailable"
                         | "subscription_sharing_user_unavailable"
                 );
-            if !temporary || attempt == 2 {
+            // Never replay inference automatically, even if the client retries a 503.
+            // Model-catalog reads retain bounded backoff.
+            if body.is_some() || !temporary || attempt == 2 {
                 return Err(error);
             }
             let delay = error
@@ -388,6 +506,10 @@ impl Client {
         unreachable!("bounded request loop")
     }
     pub async fn responses(&self, body: &Value) -> Result<reqwest::Response, ApiError> {
+        crate::logging::create_logger("siwc").info(
+            "siwc_request_shape",
+            super::translate::request_shape(body).as_object().cloned(),
+        );
         self.request(Some(body)).await
     }
     pub async fn models(&self) -> Result<Vec<Value>, ApiError> {
