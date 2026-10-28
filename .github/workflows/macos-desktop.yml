@@ -1,0 +1,75 @@
+name: Claude Bridge macOS
+
+on:
+  workflow_dispatch:
+    inputs:
+      distribution:
+        description: Developer ID signed and notarized distribution
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  desktop:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: bash scripts/macos/test_terminal.sh
+      - name: Import Developer ID into temporary keychain
+        if: inputs.distribution
+        env:
+          BRIDGE_CERTIFICATE_P12: ${{ secrets.BRIDGE_CERTIFICATE_P12 }}
+          BRIDGE_CERTIFICATE_PASSWORD: ${{ secrets.BRIDGE_CERTIFICATE_PASSWORD }}
+          BRIDGE_KEYCHAIN_PASSWORD: ${{ secrets.BRIDGE_KEYCHAIN_PASSWORD }}
+          BRIDGE_NOTARY_KEY: ${{ secrets.BRIDGE_NOTARY_KEY }}
+          BRIDGE_NOTARY_KEY_ID: ${{ secrets.BRIDGE_NOTARY_KEY_ID }}
+          BRIDGE_NOTARY_ISSUER: ${{ secrets.BRIDGE_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$BRIDGE_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/bridge.p12"
+          printf '%s' "$BRIDGE_NOTARY_KEY" > "$RUNNER_TEMP/bridge-notary.p8"
+          security create-keychain -p "$BRIDGE_KEYCHAIN_PASSWORD" "$RUNNER_TEMP/bridge.keychain-db"
+          security set-keychain-settings -lut 21600 "$RUNNER_TEMP/bridge.keychain-db"
+          security unlock-keychain -p "$BRIDGE_KEYCHAIN_PASSWORD" "$RUNNER_TEMP/bridge.keychain-db"
+          security import "$RUNNER_TEMP/bridge.p12" -P "$BRIDGE_CERTIFICATE_PASSWORD" -k "$RUNNER_TEMP/bridge.keychain-db" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$BRIDGE_KEYCHAIN_PASSWORD" "$RUNNER_TEMP/bridge.keychain-db"
+          security list-keychain -d user -s "$RUNNER_TEMP/bridge.keychain-db" login.keychain-db
+          xcrun notarytool store-credentials bridge-ci --key "$RUNNER_TEMP/bridge-notary.p8" --key-id "$BRIDGE_NOTARY_KEY_ID" --issuer "$BRIDGE_NOTARY_ISSUER" --keychain "$RUNNER_TEMP/bridge.keychain-db"
+      - name: Build local test package
+        if: '!inputs.distribution'
+        run: bash scripts/macos/build.sh
+      - name: Build signed and notarized package
+        if: inputs.distribution
+        env:
+          BRIDGE_SIGN_IDENTITY: ${{ secrets.BRIDGE_SIGN_IDENTITY }}
+          BRIDGE_TEAM_ID: ${{ secrets.BRIDGE_TEAM_ID }}
+          BRIDGE_UPDATE_FEED: ${{ vars.BRIDGE_UPDATE_FEED }}
+          BRIDGE_NOTARY_PROFILE: bridge-ci
+        run: bash scripts/macos/build.sh
+      - run: python3 scripts/macos/test_install.py 'dist/Claude Bridge.app'
+      - run: python3 scripts/macos/audit_bundle.py 'dist/Claude Bridge.app'
+      - run: hdiutil verify 'dist/Claude Bridge.dmg'
+      - name: Archive app preserving executable modes and signatures
+        run: ditto -c -k --keepParent 'dist/Claude Bridge.app' 'dist/Claude Bridge.app.zip'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Claude-Bridge-Apple-Silicon
+          path: |
+            dist/Claude Bridge.dmg
+            dist/Claude Bridge.app.zip
+            dist/native/
+            dist/SHA256SUMS
+      - name: Remove signing material
+        if: always() && inputs.distribution
+        run: |
+          security delete-keychain "$RUNNER_TEMP/bridge.keychain-db" || true
+          rm -f "$RUNNER_TEMP/bridge.p12" "$RUNNER_TEMP/bridge-notary.p8"

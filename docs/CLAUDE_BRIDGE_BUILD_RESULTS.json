@@ -1,0 +1,126 @@
+{
+  "product": "Claude Bridge",
+  "version": "0.2.0",
+  "target": "aarch64-apple-darwin",
+  "minimum_macos": "13.0",
+  "recorded_utc": "2026-10-28T09:03:16+00:00",
+  "host": {
+    "macos": "27.2",
+    "architecture": "arm64"
+  },
+  "source_branch": "feat/official-chatgpt-oauth",
+  "siwc_baseline_commit": "7a867c76659c73e82c6de3f11ceeb502511dd85b",
+  "required_checks": {
+    "cargo fmt --check": {
+      "exit_code": 0
+    },
+    "cargo clippy --all-targets -- -D warnings": {
+      "exit_code": 0
+    },
+    "cargo test": {
+      "exit_code": 0,
+      "passed": 1196,
+      "failed": 0,
+      "suites": 16
+    },
+    "cargo build --release --locked": {
+      "exit_code": 0
+    }
+  },
+  "package_build": {
+    "command": "bash scripts/macos/build.sh",
+    "exit_code": 0,
+    "native_swiftui": true,
+    "bundled_runtime": true,
+    "bundled_claude_code": false
+  },
+  "package_install_regression": {
+    "passed": 30,
+    "fresh_os_test": false,
+    "reboot_test": false,
+    "oauth_test": false
+  },
+  "native_terminal_document_regression": {
+    "passed": 4,
+    "checks": [
+      "private executable document",
+      "quoted project and launcher preserve cwd",
+      "new login shell",
+      "symlink runtime rejected"
+    ]
+  },
+  "real_installed_cli": {
+    "text": true,
+    "resume": true,
+    "continue": true,
+    "native_tools": [
+      "Bash",
+      "Read",
+      "Write"
+    ],
+    "app_may_be_closed": true,
+    "fresh_oauth": false,
+    "real_reboot": false
+  },
+  "real_gui": {
+    "launcher_install_and_shell_consent": true,
+    "shell_verification": true,
+    "existing_authorization_explicitly_linked": true,
+    "real_account_catalog": true,
+    "real_model_connection_test": true,
+    "project_open_request_accepted": true,
+    "project_interactive_terminal_verified": false,
+    "terminal_ui_block_reason": "Computer Use is not allowed to use com.apple.Terminal for safety reasons"
+  },
+  "service_recovery": {
+    "real_kill_and_recovery_inference": true,
+    "real_job_bootstrap_and_inference": true,
+    "real_os_reboot": false
+  },
+  "native_claude_sha256_before_and_after": "ffb64331bc0ee1b69efb7c2c428bd3ab516bc31b75bf60886b356c97c1c25ffd",
+  "bundle_audit": {
+    "files_scanned": 13,
+    "forbidden_auth_files": 0,
+    "credential_matches": 0,
+    "reference_available": true
+  },
+  "codesign_strict": {
+    "exit_code": 0,
+    "identity": "ad hoc",
+    "developer_id": false
+  },
+  "dmg_verify": {
+    "exit_code": 0,
+    "checksum_valid": true
+  },
+  "public_distribution_ready": false,
+  "pending_acceptance": [
+    "Developer ID signing and Apple notarization",
+    "quarantined browser download on a clean Apple Silicon Mac",
+    "fresh macOS user without build tools",
+    "new independent ChatGPT browser OAuth grant",
+    "GUI project interactive terminal conversation",
+    "real shutdown and reboot without reopening app",
+    "independent users with large native session history",
+    "Terminal iTerm2 and Ghostty on independent fresh users",
+    "two signed notarized versions and hosted HTTPS update feed"
+  ],
+  "artifacts": {
+    "dist/Claude Bridge.dmg": {
+      "bytes": 19537030,
+      "sha256": "3da6f5763d6fe90faba5915251f4a5876deb0a8f3ee1bd9a47701d512bd69c93"
+    },
+    "dist/native/claude-gpt": {
+      "bytes": 17373168,
+      "sha256": "a767793d13fb8a26ca27a6bd006be46206de3d33c80da341861b65e3fe6f802c"
+    },
+    "dist/native/claude-code-proxy": {
+      "bytes": 23086704,
+      "sha256": "7fde750f1c94e5d6e4a5909381b4fe3357e49441ce93d49bc50f05485a78a85e"
+    },
+    "dist/Claude Bridge.app/Contents/MacOS/Claude Bridge": {
+      "bytes": 877792,
+      "sha256": "216eb6b3f08decad4f7b5ba8f7badac46dd91044233096e773b532df21af3035"
+    }
+  }
+}

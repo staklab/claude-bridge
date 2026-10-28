@@ -142,7 +142,12 @@ impl Attempt {
             .append_pair("code_challenge_method", "S256")
             .append_pair("code_challenge", &challenge);
         if client_id == DYNAMIC_CLIENT {
-            q.append_pair("agent_name_hint", "claude-code-proxy");
+            let app_name = if std::env::var("CCP_SIWC_APP_NAME").as_deref() == Ok("Claude Bridge") {
+                "Claude Bridge"
+            } else {
+                "claude-code-proxy"
+            };
+            q.append_pair("agent_name_hint", app_name);
         }
         if consent {
             q.append_pair("prompt", "consent");
@@ -709,7 +714,7 @@ pub(super) async fn wait_callback(
                         ("referrer-policy", "no-referrer"),
                         ("content-security-policy", "default-src 'none'"),
                     ],
-                    "Authorization received. Return to the terminal for validation results.",
+                    "Authorization received. Return to Claude Bridge or your terminal for validation results.",
                 )
                     .into_response()
             }

@@ -20,3 +20,6 @@ pub use crate::anthropic::error::{ErrorDetail, ErrorEnvelope, json_error};
 pub use crate::anthropic::schema::MessagesRequest;
 pub use crate::provider::{AuthCommand, CliHandlers, Provider, RequestContext};
 pub use crate::registry::Registry;
+
+#[cfg(unix)]
+pub mod bridge;

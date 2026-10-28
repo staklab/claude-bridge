@@ -1,5 +1,18 @@
 # claude-code-proxy
 
+## Claude Bridge for macOS (this SIWC branch)
+
+This branch includes a native Apple Silicon desktop app, a user-scoped `claude-gpt`
+launcher, on-demand service management, and actual App / DMG packaging. The original
+`claude` command remains independent. Start with the
+[user guide](docs/CLAUDE_BRIDGE_USER_GUIDE.md),
+[acceptance report](docs/CLAUDE_BRIDGE_TEST_REPORT.md), and
+[build / signing guide](docs/CLAUDE_BRIDGE_DEVELOPMENT.md).
+Local test builds are **not ready for public distribution** until Developer ID
+signing, Apple notarization, and the remaining clean-system acceptance are complete.
+End users use the graphical setup wizard; the Cargo commands below are for developers.
+
+
 Claude Code, powered by **OpenAI Codex**, **Kimi**, **Grok**, **OpenCode Go**,
 or **Cursor Agent**.
 
