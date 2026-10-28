@@ -32,6 +32,26 @@ protocol translation, streaming responses, and diagnostics. The built-in
 monitor shows sessions, active and recent requests, errors, token usage, and
 throughput.
 
+## Official Sign in with ChatGPT (SIWC)
+
+This branch adds an isolated `siwc` mode using official dynamic OAuth registration
+and `https://api.openai.com/v1/responses` with ChatGPT plan permission. It uses
+its own credentials and never falls back to the legacy Codex transport.
+
+```sh
+cargo build --release --locked
+./target/release/claude-code-proxy siwc auth login
+./target/release/claude-code-proxy siwc models
+./target/release/claude-code-proxy siwc serve --model '<slug from siwc models>'
+```
+
+The user completes authorization in their browser. No paid API key is required.
+Live OAuth and Claude Code integration remain **pending manual verification**.
+See the [SIWC usage guide](docs/SIWC_USAGE.md),
+[compatibility and security limits](docs/SIWC_COMPATIBILITY.md),
+[implementation plan](docs/SIWC_IMPLEMENTATION_PLAN.md), and
+[test report](docs/SIWC_TEST_REPORT.md) before using an existing session.
+
 ## Quick start with Codex
 
 Install on macOS or Linux:
