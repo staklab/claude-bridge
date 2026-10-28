@@ -1,6 +1,6 @@
 # 官方 SIWC 使用指南
 
-本分支新增独立的 `siwc` 模式。真实账号授权和 Claude Code 实机验收目前**待人工验证**；Mock 测试不能代表你的账号已获准调用某个模型。当前支持 macOS/Linux 的私有文件凭据，主要构建目标为 macOS Apple Silicon。
+本分支新增独立的 `siwc` 模式。已复用用户现有真实 OAuth 授权，通过新 Release 的本地 `/v1/messages` 完成 `gpt-6.1-sol` 基础文本流式及非流式验证；Claude Code 实际工具和历史恢复仍**待人工验证**。这不代表所有账号和模型均有使用资格。当前支持 macOS/Linux 的私有文件凭据，主要构建目标为 macOS Apple Silicon。
 
 ## 1. 构建
 
@@ -74,7 +74,7 @@ export CCP_SIWC_MODEL='<siwc models 输出的 id>'
 ## 4. 独立终端做文本验证
 
 ```sh
-curl --fail-with-body --no-buffer http://127.0.0.1:18765/v1/messages \
+curl --noproxy 127.0.0.1 --fail-with-body --no-buffer http://127.0.0.1:18765/v1/messages \
   -H 'Content-Type: application/json' \
   -d '{"model":"siwc","max_tokens":256,"stream":true,"messages":[{"role":"user","content":"请只回复：SIWC OK"}]}'
 ```
@@ -158,10 +158,14 @@ claude --resume
 | HTTP 503 | 对明确临时错误最多请求三次；Retry-After 超过 5 秒则立即返回，让用户稍后再试。 |
 | model_not_found / 模型不可用 | 重新运行该 profile 的 `siwc models`，选择模型并实际验证；目录不保证资格。 |
 | siwc_stream_error | 网络中断、缺少完成事件、无效工具关联等均失败；保留客户端历史后人工决定重试，避免重复工具副作用。 |
+| siwc_unexpected_content_type | 查看 `upstream_status`、`upstream_content_type`、`upstream_request_id` 和 `upstream_error_code`。成功 HTTP 返回 JSON/HTML 等内容时，本地返回 502；真实上游状态仍单独保留，例如 200。 |
+| siwc_sse_content_type_missing 日志 | 当前链路缺少 Content-Type，但在 10 秒、64 KiB 内验证了 Responses SSE 首帧；这是诊断提示，仍须等待最终完成事件。无法通过探测的响应会报协议错误。 |
 | unsupported tool/content | 参考兼容性表；关闭动态 tool search，使用本地 function tools。 |
 | 本地 403 | 仅支持回环 CLI 请求；检查 Host、Origin、监听地址。 |
 | 凭据权限错误 | 检查 siwc 目录 0700、其中普通文件 0600，不能是 symlink/hardlink；不要放宽权限。 |
 
 本地文件：`<CCP_CONFIG_DIR>/siwc/state.json`、`state.lock`；默认是 `~/.config/claude-code-proxy/siwc/`。不要上传这些文件。本实现未启用 Keychain，不应将凭据目录共享或同步到不受信任的设备。
+
+响应诊断中的 `upstream_status` 表示实际收到的上游 HTTP 状态，`proxy_status` 表示代理错误分类；已经开始的 HTTP 200 流可通过 error 事件报告失败。请求 ID 兼容 `x-request-id`、`x-oai-request-id` 和 `x-openai-request-id`，本地响应使用 `x-openai-request-id` 转交。日志只保存状态、Content-Type、Request ID 和经过筛选的错误代码，不保存错误消息、Authorization 或完整请求。转交客户端的错误信息也会脱敏凭据和可识别的请求文本回显。
 
 Claude Code 配置依据：[模型配置](https://code.claude.com/docs/en/model-config)、[环境变量](https://code.claude.com/docs/en/env-vars)、[工作流程与恢复](https://code.claude.com/docs/en/common-workflows)。

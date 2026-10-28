@@ -1,5 +1,8 @@
 //! Incremental, bounded SSE parsing plus SIWC completion/tool integrity checks.
-use super::{auth::Auth, client::ApiError};
+use super::{
+    auth::{Auth, read_json},
+    client::{ApiError, ResponseContext, ResponseInfo},
+};
 
 pub(super) type UsagePause = std::sync::Arc<std::sync::Mutex<Option<ApiError>>>;
 
@@ -107,6 +110,15 @@ fn protocol(message: &str) -> ApiError {
     ApiError::local(StatusCode::BAD_GATEWAY, "siwc_stream_error", message)
 }
 
+fn with_request_id(mut response: Response, info: &ResponseInfo) -> Response {
+    if let Some(id) = &info.request_id
+        && let Ok(id) = id.parse()
+    {
+        response.headers_mut().insert("x-openai-request-id", id);
+    }
+    response
+}
+
 struct Call {
     id: String,
     name: String,
@@ -122,52 +134,118 @@ pub(super) struct Reader {
     calls: HashMap<u64, Call>,
     call_ids: HashSet<String>,
     pub complete: bool,
-    request_id: Option<String>,
+    context: ResponseContext,
     auth: Auth,
     last_check: tokio::time::Instant,
     last_chunk: tokio::time::Instant,
     last_ping: tokio::time::Instant,
 }
 impl Reader {
-    pub fn new(
+    pub async fn new(
         response: reqwest::Response,
         names: HashSet<String>,
         auth: Auth,
     ) -> Result<Self, ApiError> {
-        if !response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|s| {
-                s.split(';')
-                    .next()
-                    .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
-            })
-        {
-            return Err(protocol("Responses API did not return text/event-stream"));
+        let context = ResponseContext::from_response(&response);
+        // HTTP admission errors must be classified before applying the stream contract.
+        if !response.status().is_success() {
+            let raw = tokio::time::timeout(Duration::from_secs(15), read_json(response))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(Value::Null);
+            return Err(context.http_error(raw));
         }
-        let request_id = response
-            .headers()
-            .get("x-request-id")
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-        Ok(Self {
+        if context.info.content_type.as_deref().is_some_and(|s| {
+            !s.split(';')
+                .next()
+                .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/event-stream"))
+        }) {
+            let raw = tokio::time::timeout(Duration::from_secs(15), read_json(response))
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .unwrap_or(Value::Null);
+            return Err(context.unexpected_type(raw));
+        }
+        let missing_type = context.info.content_type.is_none();
+        let mut reader = Self {
             response,
             decoder: Decoder::default(),
             names,
             calls: HashMap::new(),
             call_ids: HashSet::new(),
             complete: false,
-            request_id,
+            context,
             auth,
             last_check: tokio::time::Instant::now() - Duration::from_secs(1),
             last_chunk: tokio::time::Instant::now(),
             last_ping: tokio::time::Instant::now(),
-        })
+        };
+        if missing_type {
+            // Some direct-route responses omit Content-Type. Accept only a bounded,
+            // verified Responses SSE prelude; JSON/HTML never becomes a successful stream.
+            reader.detect_sse().await?;
+            let diagnostic = ApiError::local(
+                StatusCode::OK,
+                "siwc_sse_content_type_missing",
+                "Verified Responses SSE without Content-Type",
+            )
+            .with_upstream(&reader.context.info);
+            crate::logging::create_logger("siwc").warn(
+                "siwc_sse_content_type_missing",
+                diagnostic.diagnostics().as_object().cloned(),
+            );
+        }
+        Ok(reader)
+    }
+    async fn detect_sse(&mut self) -> Result<(), ApiError> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut prefix = Vec::new();
+        loop {
+            let chunk = tokio::time::timeout_at(deadline, self.response.chunk())
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .flatten();
+            let Some(chunk) = chunk else {
+                return Err(self
+                    .context
+                    .unexpected_type(serde_json::from_slice(&prefix).unwrap_or(Value::Null)));
+            };
+            if prefix.len() + chunk.len() > 64 * 1024 {
+                return Err(self.context.unexpected_type(Value::Null));
+            }
+            prefix.extend_from_slice(&chunk);
+            if matches!(
+                prefix.iter().copied().find(|b| !b.is_ascii_whitespace()),
+                Some(b'{' | b'[')
+            ) {
+                if let Ok(raw) = serde_json::from_slice::<Value>(&prefix) {
+                    return Err(self.context.unexpected_type(raw));
+                }
+                continue;
+            }
+            self.decoder
+                .push(&chunk)
+                .map_err(|_| self.context.unexpected_type(Value::Null))?;
+            if let Some(event) = self.decoder.events.front() {
+                if !event["type"]
+                    .as_str()
+                    .is_some_and(|kind| kind.starts_with("response.") || kind == "error")
+                {
+                    return Err(self.context.unexpected_type(Value::Null));
+                }
+                self.last_chunk = tokio::time::Instant::now();
+                return Ok(());
+            }
+        }
     }
     pub async fn next(&mut self) -> Result<Option<Value>, ApiError> {
         self.next_inner().await.map_err(|mut error| {
-            error.request_id = self.request_id.clone();
+            error.body = self.context.sanitize(error.body);
+            error = error.with_upstream(&self.context.info);
+            error.report();
             error
         })
     }
@@ -188,10 +266,7 @@ impl Reader {
                 if value["type"] == "response.refusal.delta" {
                     value["type"] = json!("response.output_text.delta");
                 }
-                if let Err(mut e) = self.validate(&value) {
-                    e.request_id = self.request_id.clone();
-                    return Err(e);
-                }
+                self.validate(&value)?;
                 return Ok(Some(value));
             }
             if self.last_chunk.elapsed() >= Duration::from_secs(90) {
@@ -243,8 +318,9 @@ impl Reader {
                 return Err(ApiError {
                     status,
                     body: json!({"error":error,"event":value}),
-                    request_id: self.request_id.clone(),
+                    request_id: self.context.info.request_id.clone(),
                     retry_after: None,
+                    upstream: Some(Box::new(self.context.info.clone())),
                 });
             }
             "response.done" => {
@@ -392,11 +468,15 @@ pub(super) async fn response(
     pause: UsagePause,
     auth: Auth,
 ) -> Response {
-    let reader = match Reader::new(response, names, auth) {
+    let reader = match Reader::new(response, names, auth).await {
         Ok(reader) => reader,
-        Err(e) => return e.response(),
+        Err(e) => {
+            e.report();
+            return e.response();
+        }
     };
     let id = format!("msg_{}", uuid::Uuid::new_v4().simple());
+    let info = reader.context.info.clone();
     if !stream_requested {
         let mut reader = reader;
         let mut bytes = Vec::new();
@@ -409,6 +489,7 @@ pub(super) async fn response(
                     ));
                     if bytes.len() > MAX_BUFFERED_RESPONSE {
                         return protocol("Buffered response exceeds limit; use streaming")
+                            .with_upstream(&info)
                             .response();
                     }
                 }
@@ -419,10 +500,13 @@ pub(super) async fn response(
                 }
             }
         }
-        return match accumulate_response(&bytes, &id, &model) {
+        let response = match accumulate_response(&bytes, &id, &model) {
             Ok(value) => axum::Json(value).into_response(),
-            Err(_) => protocol("Could not translate completed response").response(),
+            Err(_) => protocol("Could not translate completed response")
+                .with_upstream(&info)
+                .response(),
         };
+        return with_request_id(response, &info);
     }
     struct Live {
         reader: Reader,
@@ -457,7 +541,9 @@ pub(super) async fn response(
                     Err(_) => {
                         state.done = true;
                         state.outcome.fail();
-                        let e = protocol("Could not translate Responses stream");
+                        let e = protocol("Could not translate Responses stream")
+                            .with_upstream(&state.reader.context.info);
+                        e.report();
                         let bytes = crate::anthropic::sse::encode_sse_event(
                             Some("error"),
                             &e.envelope().to_string(),
@@ -489,5 +575,5 @@ pub(super) async fn response(
     )
         .into_response();
     response.extensions_mut().insert(outcome);
-    response
+    with_request_id(response, &info)
 }

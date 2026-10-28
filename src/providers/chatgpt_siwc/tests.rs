@@ -36,6 +36,9 @@ struct MockData {
     revoke: StatusCode,
     redirect: Option<String>,
     slow_stream: bool,
+    response_content_type: Option<Option<String>>,
+    request_id_header: String,
+    disconnect_stream: bool,
 }
 struct Mock {
     data: Arc<Mutex<MockData>>,
@@ -63,6 +66,9 @@ impl Mock {
             revoke: StatusCode::OK,
             redirect: None,
             slow_stream: false,
+            response_content_type: None,
+            request_id_header: "x-request-id".into(),
+            disconnect_stream: false,
         }));
         let app = Router::new()
             .fallback(any(mock_handler))
@@ -131,6 +137,21 @@ async fn mock_handler(
         "/v1/responses" => {
             if let Some(url) = &data.redirect { return (StatusCode::TEMPORARY_REDIRECT, [("location",url.clone())]).into_response(); }
             let (status, body) = data.responses.pop_front().expect("unexpected inference request");
+            let mut headers = HeaderMap::new();
+            if let Some(content_type) = data.response_content_type.clone().unwrap_or_else(|| Some(if status.is_success() { "text/event-stream" } else { "application/json" }.into())) {
+                headers.insert("content-type", content_type.parse().unwrap());
+            }
+            headers.insert(data.request_id_header.parse::<axum::http::HeaderName>().unwrap(), "req_siwc_mock".parse().unwrap());
+            if data.disconnect_stream {
+                let stream = futures_util::stream::unfold((0, body), |(index, body)| async move {
+                    match index {
+                        0 => Some((Ok(bytes::Bytes::from(body.clone())), (1, body))),
+                        1 => { tokio::time::sleep(std::time::Duration::from_millis(50)).await; Some((Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset)), (2, body))) },
+                        _ => None,
+                    }
+                });
+                return (status, headers, Body::from_stream(stream)).into_response();
+            }
             if data.slow_stream && status.is_success() {
                 let cut = body.rfind("data:").unwrap_or(0);
                 let chunks = [body[..cut].to_string(), body[cut..].to_string()];
@@ -139,9 +160,9 @@ async fn mock_handler(
                     if index == 1 { tokio::time::sleep(std::time::Duration::from_millis(800)).await; }
                     Some((Ok::<_,std::io::Error>(bytes::Bytes::from(chunks[index].clone())), (index+1,chunks)))
                 });
-                return (status, [("content-type","text/event-stream"),("x-request-id","req_siwc_mock")], Body::from_stream(stream)).into_response();
+                return (status, headers, Body::from_stream(stream)).into_response();
             }
-            (status, [("content-type",if status.is_success() {"text/event-stream"} else {"application/json"}), ("x-request-id","req_siwc_mock")], body).into_response()
+            (status, headers, Body::from(body)).into_response()
         }
         _ => StatusCode::NOT_FOUND.into_response(),
     }
@@ -569,6 +590,15 @@ async fn discovery_and_outbound_requests_use_only_allowed_headers_and_paths() {
                     .unwrap()
                     .starts_with("claude-code-proxy/")
             );
+            if r.path == "/v1/responses" {
+                let wire: Value = serde_json::from_slice(&r.body).unwrap();
+                assert_eq!(wire["model"], "gpt-test");
+                assert_eq!(wire["store"], false);
+                assert_eq!(wire["stream"], true);
+                assert!(wire["input"].is_array());
+                assert!(wire.get("max_output_tokens").is_none());
+                assert!(wire.get("previous_response_id").is_none());
+            }
         }
     }
 }
@@ -1228,5 +1258,188 @@ async fn terminal_tool_call_cannot_change_completed_arguments() {
         let text = body(response).await;
         assert!(text.contains("changed tool call"));
         assert!(!text.contains("message_stop"));
+    }
+}
+
+#[tokio::test]
+async fn response_http_errors_are_preserved_before_sse_validation() {
+    let mock = Mock::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let auth = signed_in(&mock, Store::new(dir.path().join("siwc"))).await;
+    for status in [400, 401, 403, 429] {
+        for content_type in [
+            Some("application/json"),
+            Some("text/event-stream; charset=utf-8"),
+            None,
+        ] {
+            mock.data.lock().unwrap().response_content_type = Some(content_type.map(String::from));
+            let code = if status == 429 {
+                "subscription_sharing_usage_limit_exceeded"
+            } else {
+                "invalid_request_error"
+            };
+            let raw = json!({"error":{"code":code,"param":"model","message":"request refused"}});
+            mock.reply(StatusCode::from_u16(status).unwrap(), raw.to_string());
+            let p = provider(auth.clone());
+            let response = p.handle_messages(request(true), context()).await;
+            assert_eq!(response.status().as_u16(), status);
+            assert_eq!(response.headers()["x-openai-request-id"], "req_siwc_mock");
+            let error: Value = serde_json::from_str(&body(response).await).unwrap();
+            assert_eq!(error["error"]["code"], code);
+            assert_eq!(error["error"]["param"], "model");
+            assert_eq!(error["upstream_status"], status);
+            assert_eq!(error["proxy_status"], status);
+            assert_eq!(error["upstream_body"], raw);
+            assert_eq!(error["upstream_content_type"], json!(content_type));
+            assert_eq!(error["upstream_request_id"], "req_siwc_mock");
+        }
+    }
+    assert_eq!(mock.count("/v1/responses"), 12);
+    assert_eq!(mock.count("/token"), 1);
+}
+
+#[tokio::test]
+async fn response_sse_accepts_media_type_parameters_and_missing_header() {
+    let mock = Mock::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let auth = signed_in(&mock, Store::new(dir.path().join("siwc"))).await;
+    let p = provider(auth);
+    for content_type in [
+        Some("text/event-stream"),
+        Some("text/event-stream; charset=utf-8"),
+        Some("Text/Event-Stream ; charset=UTF-8"),
+        None,
+    ] {
+        mock.data.lock().unwrap().response_content_type = Some(content_type.map(String::from));
+        mock.data.lock().unwrap().request_id_header = "x-oai-request-id".into();
+        for stream in [true, false] {
+            mock.reply(StatusCode::OK, text_events());
+            let response = p.handle_messages(request(stream), context()).await;
+            assert_eq!(response.status(), 200);
+            assert_eq!(response.headers()["x-openai-request-id"], "req_siwc_mock");
+            let text = body(response).await;
+            assert!(text.contains("你好"));
+            assert!(!text.contains("siwc_unexpected_content_type"));
+            assert_eq!(text.contains("message_stop"), stream);
+        }
+    }
+}
+
+#[tokio::test]
+async fn successful_non_sse_is_protocol_error_with_real_upstream_metadata() {
+    let mock = Mock::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let auth = signed_in(&mock, Store::new(dir.path().join("siwc"))).await;
+    let p = provider(auth);
+    for content_type in [Some("application/json; charset=utf-8"), None] {
+        mock.data.lock().unwrap().response_content_type = Some(content_type.map(String::from));
+        mock.data.lock().unwrap().request_id_header = "x-oai-request-id".into();
+        for stream in [true, false] {
+            mock.reply(StatusCode::OK, json!({"error":{"code":"subscription_sharing_unsupported_capability","param":"input","message":"unsupported input"}}).to_string());
+            let response = p.handle_messages(request(stream), context()).await;
+            assert_eq!(response.status(), 502);
+            let error: Value = serde_json::from_str(&body(response).await).unwrap();
+            assert_eq!(error["error"]["code"], "siwc_unexpected_content_type");
+            assert_eq!(error["upstream_status"], 200);
+            assert_eq!(error["proxy_status"], 502);
+            assert_eq!(
+                error["upstream_error_code"],
+                "subscription_sharing_unsupported_capability"
+            );
+            assert_eq!(error["upstream_content_type"], json!(content_type));
+            assert_eq!(error["upstream_request_id"], "req_siwc_mock");
+            assert_eq!(
+                error["upstream_body"]["upstream_error"]["error"]["param"],
+                "input"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn response_errors_redact_bearer_and_project_data_from_display_and_diagnostics() {
+    let mock = Mock::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let auth = signed_in(&mock, Store::new(dir.path().join("siwc"))).await;
+    let client = Client::new(auth);
+    let project_text = "private-project-secret-canary";
+    let request_body = json!({"model":"gpt-test","input":[{"role":"user","content":project_text}],"store":false,"stream":true});
+    mock.reply(StatusCode::BAD_REQUEST, json!({"error":{"code":"invalid_request_error","param":"input","message":format!("Bearer mock-access: rejected {project_text}; sk-secret-canary")},"request":request_body,"authorization":"Bearer mock-access","refresh_token":"secret-refresh-canary"}).to_string());
+    let error = client.responses(&request_body).await.unwrap_err();
+    let envelope = error.envelope().to_string();
+    for secret in [
+        "mock-access",
+        "secret-refresh-canary",
+        "sk-secret-canary",
+        project_text,
+    ] {
+        assert!(!envelope.contains(secret));
+        assert!(!error.to_string().contains(secret));
+        assert!(!error.diagnostics().to_string().contains(secret));
+    }
+    assert_eq!(error.diagnostics().as_object().unwrap().len(), 5);
+    assert_eq!(
+        error.diagnostics()["upstream_error_code"],
+        "invalid_request_error"
+    );
+    assert!(error.diagnostics().get("message").is_none());
+    assert_eq!(error.envelope()["error"]["param"], "input");
+    let discussed_code = "invalid_request_error";
+    let request_body = json!({"input":[{"role":"user","content":discussed_code}]});
+    mock.reply(
+        StatusCode::BAD_REQUEST,
+        json!({"error":{"code":discussed_code,"param":"input","message":"refused"}}).to_string(),
+    );
+    let error = client.responses(&request_body).await.unwrap_err();
+    assert_eq!(error.envelope()["error"]["code"], discussed_code);
+}
+
+#[tokio::test]
+async fn response_disconnect_and_missing_completion_keep_http_metadata_without_success() {
+    let mock = Mock::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let auth = signed_in(&mock, Store::new(dir.path().join("siwc"))).await;
+    let p = provider(auth);
+    for disconnect in [false, true] {
+        mock.data.lock().unwrap().disconnect_stream = disconnect;
+        mock.data.lock().unwrap().request_id_header = "x-oai-request-id".into();
+        mock.reply(
+            StatusCode::OK,
+            event(json!({"type":"response.output_text.delta","output_index":0,"delta":"partial"})),
+        );
+        let text = body(p.handle_messages(request(true), context()).await).await;
+        assert!(!text.contains("message_stop"));
+        let error = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|event| event["type"] == "error")
+            .unwrap();
+        assert_eq!(error["upstream_status"], 200);
+        assert_eq!(error["proxy_status"], 502);
+        assert_eq!(error["upstream_content_type"], "text/event-stream");
+        assert_eq!(error["upstream_request_id"], "req_siwc_mock");
+    }
+}
+
+#[tokio::test]
+async fn missing_content_type_probe_rejects_non_responses_and_oversized_preludes() {
+    let mock = Mock::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let auth = signed_in(&mock, Store::new(dir.path().join("siwc"))).await;
+    let p = provider(auth);
+    mock.data.lock().unwrap().response_content_type = Some(None);
+    for value in [
+        String::new(),
+        "<html>not SSE</html>".into(),
+        event(json!({"type":"unrelated_event"})),
+        format!(":{}\n\n{}", "x".repeat(65 * 1024), text_events()),
+    ] {
+        mock.reply(StatusCode::OK, value);
+        let response = p.handle_messages(request(true), context()).await;
+        assert_eq!(response.status(), 502);
+        let error: Value = serde_json::from_str(&body(response).await).unwrap();
+        assert_eq!(error["upstream_status"], 200);
+        assert_eq!(error["error"]["code"], "siwc_unexpected_content_type");
     }
 }

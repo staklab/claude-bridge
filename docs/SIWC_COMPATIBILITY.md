@@ -1,6 +1,6 @@
 # SIWC 兼容性与安全边界
 
-本页描述已实现和 Mock 验证的代理行为。真实 OAuth、账号模型推理、Claude Code UI 与真实编程工具验收均待人工验证，不能视为已经完成端到端验收。
+本页描述代理行为及验证范围。已复用真实 OAuth 授权，通过本地 `/v1/messages` 验证 `gpt-6.1-sol` 基础文本流式和非流式推理。Claude Code UI、编程工具、长会话压缩与 `/resume` 仍待人工验证；其他模型的权限需逐次由官方 API 判定。
 
 ## 能力矩阵
 
@@ -47,6 +47,7 @@ Anthropic 的 max_tokens、temperature、top_p、top_k、metadata、stop_sequenc
 - OAuth 与 API 均关闭重定向、验证 TLS；生产端点不提供环境覆盖。Mock 地址只能在测试模块内构造。
 - 不保存请求/响应流量；不会把授权 URL 中的 ID Token hint 输出到日志。错误正文交给客户端，代理日志不写入 SIWC 上游错误内容。CLI status 不显示 Token。
 - 初次 HTTP 失败保留状态、JSON body 形状、code/param、请求 ID，局部脱敏 bearer 回显；未知非 JSON 错误返回通用说明。SSE 失败保留结构化错误及请求 ID。
+- 先判断 HTTP 状态，再判断 SSE 类型；带 charset 的媒体类型可用。缺少 Content-Type 时只在 10 秒、64 KiB 内确认 Responses SSE 首帧后继续；显式 JSON/HTML 或无法确认的成功响应返回 `siwc_unexpected_content_type`。`upstream_status` 保留实际状态，`proxy_status` 单列代理错误分类。诊断日志使用字段白名单，不记录错误正文或项目内容。
 - 只有 response.completed 成功；response.failed/incomplete、无完成事件、网络中断和工具关联异常都返回错误。不在流内重放请求。
 - HTTP 503 明确临时错误最多两次退避；429 不自动重试，套餐额度错误使该代理进程暂停新推理，用户确认额度恢复后再重启。
 - 流式 HTTP 状态在开始后不可改变；错误通过 Anthropic error 事件送达，监控使用单独结果标记，不能仅凭 HTTP 200 判断成功。

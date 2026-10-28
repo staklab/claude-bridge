@@ -8,11 +8,178 @@ use serde_json::{Value, json};
 use std::time::Duration;
 
 #[derive(Debug, Clone)]
+pub(super) struct ResponseInfo {
+    pub status: StatusCode,
+    pub content_type: Option<String>,
+    pub request_id: Option<String>,
+}
+
+#[derive(Clone)]
+pub(super) struct ResponseContext {
+    pub info: ResponseInfo,
+    token: String,
+    redactions: Vec<String>,
+}
+
+impl ResponseContext {
+    fn new(response: &reqwest::Response, token: &str, body: Option<&Value>) -> Self {
+        let mut redactions = Vec::new();
+        if let Some(body) = body {
+            redactions.push(body.to_string());
+            collect_request_text(body, &mut redactions);
+        }
+        redactions.retain(|s| !s.is_empty());
+        redactions.sort_by_key(|s| std::cmp::Reverse(s.len()));
+        redactions.dedup();
+        let mut context = Self {
+            info: ResponseInfo {
+                status: response.status(),
+                content_type: None,
+                request_id: None,
+            },
+            token: token.to_string(),
+            redactions,
+        };
+        context.info.content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| context.text(v, 256, true));
+        context.info.request_id = ["x-request-id", "x-oai-request-id", "x-openai-request-id"]
+            .iter()
+            .find_map(|key| response.headers().get(*key).and_then(|v| v.to_str().ok()))
+            .map(|v| context.text(v, 256, true));
+        context
+    }
+
+    pub fn from_response(response: &reqwest::Response) -> Self {
+        response
+            .extensions()
+            .get::<Self>()
+            .cloned()
+            .unwrap_or_else(|| Self::new(response, "", None))
+    }
+
+    fn text(&self, value: &str, limit: usize, redact_request: bool) -> String {
+        static CREDENTIAL: std::sync::LazyLock<regex_lite::Regex> =
+            std::sync::LazyLock::new(|| {
+                regex_lite::Regex::new(
+                    r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]+=*|\b(?:sk|sess)-[A-Za-z0-9_-]+",
+                )
+                .expect("credential redaction pattern")
+            });
+        let mut safe = value.to_string();
+        if !self.token.is_empty() {
+            safe = safe.replace(&self.token, "[REDACTED]");
+        }
+        if redact_request {
+            for secret in &self.redactions {
+                safe = safe.replace(secret, "[REDACTED]");
+            }
+        }
+        CREDENTIAL
+            .replace_all(&safe, "[REDACTED]")
+            .chars()
+            .filter(|c| !c.is_control() || *c == '\n')
+            .take(limit)
+            .collect()
+    }
+
+    pub fn sanitize(&self, value: Value) -> Value {
+        match value {
+            Value::String(s) => Value::String(self.text(&s, 4096, true)),
+            Value::Array(values) => {
+                Value::Array(values.into_iter().map(|v| self.sanitize(v)).collect())
+            }
+            Value::Object(values) => Value::Object(
+                values
+                    .into_iter()
+                    .map(|(k, v)| {
+                        let sensitive = matches!(
+                            k.to_ascii_lowercase().as_str(),
+                            "authorization"
+                                | "access_token"
+                                | "refresh_token"
+                                | "id_token"
+                                | "api_key"
+                                | "request"
+                                | "request_body"
+                                | "headers"
+                                | "input"
+                                | "messages"
+                                | "instructions"
+                                | "prompt"
+                        );
+                        let identifier = matches!(k.as_str(), "code" | "param" | "type");
+                        (
+                            k,
+                            if sensitive {
+                                json!("[REDACTED]")
+                            } else if identifier && let Some(text) = v.as_str() {
+                                // A prompt may itself discuss an API error code or parameter.
+                                // Preserve machine identifiers while still removing credentials.
+                                json!(self.text(text, 4096, false))
+                            } else {
+                                self.sanitize(v)
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
+            value => value,
+        }
+    }
+
+    pub fn http_error(&self, body: Value) -> ApiError {
+        ApiError {
+            status: self.info.status,
+            body: self.sanitize(body),
+            request_id: self.info.request_id.clone(),
+            retry_after: None,
+            upstream: Some(Box::new(self.info.clone())),
+        }
+    }
+
+    pub fn unexpected_type(&self, body: Value) -> ApiError {
+        let mut error = ApiError::local(
+            StatusCode::BAD_GATEWAY,
+            "siwc_unexpected_content_type",
+            "Responses API returned a successful HTTP status without a valid SSE stream",
+        );
+        error.body["upstream_error"] = self.sanitize(body);
+        error.with_upstream(&self.info)
+    }
+}
+
+fn collect_request_text(value: &Value, out: &mut Vec<String>) {
+    match value {
+        Value::Object(values) => {
+            for (key, value) in values {
+                if !matches!(
+                    key.as_str(),
+                    "model" | "type" | "role" | "name" | "call_id" | "id"
+                ) {
+                    collect_request_text(value, out);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_request_text(value, out);
+            }
+        }
+        Value::String(text) if text.len() >= 8 => out.push(text.clone()),
+        _ => {}
+    }
+}
+
+#[derive(Debug, Clone)]
 pub(super) struct ApiError {
     pub status: StatusCode,
     pub body: Value,
     pub request_id: Option<String>,
     pub retry_after: Option<String>,
+    pub upstream: Option<Box<ResponseInfo>>,
 }
 
 impl ApiError {
@@ -22,7 +189,37 @@ impl ApiError {
             body: json!({"error":{"code":code,"message":message}}),
             request_id: None,
             retry_after: None,
+            upstream: None,
         }
+    }
+    pub fn with_upstream(mut self, info: &ResponseInfo) -> Self {
+        self.request_id = info.request_id.clone();
+        self.upstream = Some(Box::new(info.clone()));
+        self
+    }
+    pub fn diagnostics(&self) -> Value {
+        let code = self
+            .body
+            .pointer("/upstream_error/error/code")
+            .or_else(|| self.body.pointer("/error/code"))
+            .and_then(Value::as_str);
+        let safe_code = code.filter(|s| {
+            s.len() <= 128
+                && !s.starts_with("sk-")
+                && s.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-' | b'.')
+                })
+        });
+        json!({"upstream_status":self.upstream.as_ref().map(|u| u.status.as_u16()),
+            "upstream_content_type":self.upstream.as_ref().and_then(|u| u.content_type.as_deref()),
+            "upstream_request_id":self.request_id,"upstream_error_code":safe_code,
+            "proxy_status":self.status.as_u16()})
+    }
+    pub fn report(&self) {
+        crate::logging::create_logger("siwc").warn(
+            "siwc_upstream_error",
+            self.diagnostics().as_object().cloned(),
+        );
     }
     pub fn error_type(&self) -> &'static str {
         match self.status.as_u16() {
@@ -41,7 +238,11 @@ impl ApiError {
             .or_else(|| self.body.get("detail"))
             .and_then(Value::as_str)
             .unwrap_or("SIWC upstream request failed");
-        json!({"type":"error","error":{"type":self.error_type(),"message":message,"code":self.body.pointer("/error/code"),"param":self.body.pointer("/error/param")},"upstream_status":self.status.as_u16(),"upstream_body":self.body,"upstream_request_id":self.request_id})
+        let mut envelope = self.diagnostics();
+        envelope["type"] = json!("error");
+        envelope["error"] = json!({"type":self.error_type(),"message":message,"code":self.body.pointer("/error/code"),"param":self.body.pointer("/error/param")});
+        envelope["upstream_body"] = self.body.clone();
+        envelope
     }
     pub fn response(&self) -> Response {
         let mut response = (self.status, Json(self.envelope())).into_response();
@@ -65,8 +266,8 @@ impl std::fmt::Display for ApiError {
             f,
             "SIWC HTTP {} ({})",
             self.status.as_u16(),
-            self.body
-                .pointer("/error/code")
+            self.diagnostics()
+                .get("upstream_error_code")
                 .and_then(Value::as_str)
                 .unwrap_or("upstream_error")
         )
@@ -126,22 +327,19 @@ impl Client {
             let result =
                 tokio::time::timeout(Duration::from_secs(60), request.bearer_auth(&token).send())
                     .await;
-            let response = result.ok().and_then(Result::ok).ok_or_else(|| {
+            let mut response = result.ok().and_then(Result::ok).ok_or_else(|| {
                 ApiError::local(
                     StatusCode::BAD_GATEWAY,
                     "siwc_network_error",
                     "SIWC request failed or timed out before headers; no automatic replay",
                 )
             })?;
+            let context = ResponseContext::new(&response, &token, body);
             if response.status().is_success() {
+                response.extensions_mut().insert(context);
                 return Ok(response);
             }
             let status = response.status();
-            let request_id = response
-                .headers()
-                .get("x-request-id")
-                .and_then(|v| v.to_str().ok())
-                .map(String::from);
             let retry_after = response
                 .headers()
                 .get("retry-after")
@@ -154,16 +352,9 @@ impl Client {
                 .unwrap_or_else(
                     || json!({"detail":"Upstream returned an unreadable error response"}),
                 );
-            // Error payloads are untrusted; never return a reflected bearer token.
-            let raw = serde_json::to_string(&raw)
-                .unwrap_or_default()
-                .replace(&token, "[REDACTED]");
-            let error = ApiError {
-                status,
-                body: serde_json::from_str(&raw).unwrap_or(Value::Null),
-                request_id,
-                retry_after,
-            };
+            let mut error = context.http_error(raw);
+            error.retry_after = retry_after;
+            error.report();
             if error.body.pointer("/error/code").and_then(Value::as_str)
                 == Some("subscription_sharing_usage_limit_exceeded")
             {

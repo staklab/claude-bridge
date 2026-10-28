@@ -2,7 +2,9 @@
 
 日期：2026-10-27（America/Los_Angeles）。基础提交：`a08de6a`；分支：`feat/official-chatgpt-oauth`。交付提交通过 `git log -1 --oneline` 查看。代码只在本地提交，未推送远端、未创建 PR。
 
-## 验收状态
+首次交付提交为 `2f5fe50`。本报告保留首次交付记录，最新的响应处理修复和真实复测见最后一节。
+
+## 首次交付验收状态（2f5fe50）
 
 | 层级 | 结果 |
 | --- | --- |
@@ -14,7 +16,7 @@
 | Claude Code 实际文件/Bash/MCP/Skills/Hooks/Subagents | **待人工验证**。自动测试仅验证转换和协议关联，不运行真实工具。 |
 | Claude Code `/compact`、原项目 `/resume` | **待人工验证**。自动测试验证历史重放和实例重建，不代表实际客户端长会话验收完成。 |
 
-## 环境与执行结果
+## 首次交付环境与执行结果
 
 - macOS 27.2，Apple Silicon `arm64`。
 - `rustc 1.95.0 (59807616e 2026-04-14)`，host `aarch64-apple-darwin`。
@@ -36,7 +38,7 @@
 
 本地二进制：`target/release/claude-code-proxy`（`claude-code-proxy 0.1.47`）。`file` 输出为 `Mach-O 64-bit executable arm64`。本次构建 SHA-256：`a19131ee1451607b4af3056868f19cf053ec5758d6822bfb2c502331dfcdebd8`。二进制位于 Git 忽略的构建目录，源码提交不包含编译产物。
 
-## 自动测试覆盖
+## 首次交付自动测试覆盖
 
 | 类别 | 已验证行为 |
 | --- | --- |
@@ -72,7 +74,7 @@
 - 模型权限、当前套餐额度、长上下文上限、真实工具行为及 Claude Code 版本差异尚需线上验收。
 - 使用官方授权不代表零账号风险；服务端策略、工作区授权与接口预览变化仍可能阻止访问。
 
-## 修改文件清单
+## 首次交付修改文件清单
 
 | 文件 | 作用 |
 | --- | --- |
@@ -95,3 +97,43 @@
 | `docs/SIWC_IMPLEMENTATION_PLAN.md`、`SIWC_USAGE.md`、`SIWC_COMPATIBILITY.md`、`SIWC_TEST_REPORT.md` | 架构、运行、验收、安全限制及本报告。 |
 
 原 MIT `LICENSE` 和版权声明保留。未读取、修改、删除或重写用户 `~/.claude/projects/`。回滚步骤见 [使用指南](SIWC_USAGE.md#7-退出与回滚)。
+
+## 响应头修复与真实复测（2026-10-27）
+
+修复基于 `2f5fe50`，沿用现有 SIWC 模块、OAuth 和凭据格式。
+
+### 根因及证据
+
+复用用户已授权、`plan_permission=true` 的 default profile，使用其当前有效的 Access Token，向 `https://api.openai.com/v1/models` 和 `https://api.openai.com/v1/responses` 发送最小请求。模型取自官方可见目录，实测 slug 为 `gpt-6.1-sol`。推理请求使用完整的本次 input、`store=false`、`stream=true`，未包含禁止参数。
+
+当前网络链路两次返回 HTTP 200，正文包含合法 Responses SSE 和 `response.completed`，但没有 Content-Type；请求 ID 头名为 `x-oai-request-id`。现有环境配置了 HTTP/HTTPS 代理，仅凭客户端证据无法确定是源站还是中间链路省略该头。
+
+旧代码已能接受 charset 参数，非 2xx 也已在传输层先处理。此次直接失败来自 Reader 把缺少 Content-Type 的有效 SSE 一律拒绝。此外，旧错误丢失响应元数据，并将本地 502 写成 `upstream_status`，影响定位。
+
+### 修改
+
+- `src/providers/chatgpt_siwc/client.rs`：保留真实 HTTP 元数据、兼容三种请求 ID 头；使用 `upstream_status`/`proxy_status` 区分上游与本地状态；诊断日志仅输出允许字段；脱敏凭据及请求文本回显。
+- `src/providers/chatgpt_siwc/stream.rs`：状态检查优先；接受合法媒体类型参数；缺失 Content-Type 时进行有界 SSE 首帧探测；200 JSON/HTML 显式报协议错误；继续要求 `response.completed`，将请求 ID 和元数据保留至流内错误。
+- `src/providers/chatgpt_siwc/tests.rs`：新增 6 项回归，覆盖 400/401/403/429 JSON 与异常 Content-Type、普通/charset/缺头 SSE、200 JSON、真实传输中断、缺少完成事件、探测大小上限和诊断脱敏。
+- `README.md`、`docs/SIWC_USAGE.md`、`docs/SIWC_COMPATIBILITY.md`、本报告：记录诊断字段、缺头处理和验收证据。
+
+OAuth、凭据存储、端点和请求转换器未修改。凭据文件校验确认保持原样；没有重新登录、注销或调用私有 Codex 推理端点。
+
+### 最新验证结果
+
+| 检查 | 结果 |
+| --- | --- |
+| `cargo test chatgpt_siwc --lib` | 40 passed / 0 failed |
+| `cargo fmt --check` | 通过 |
+| `cargo clippy --all-targets -- -D warnings` | 通过 |
+| `cargo test` | 1180 passed / 0 failed / 0 ignored（15 组测试；其中 SIWC 模块 40 项） |
+| `cargo build --release --locked` | 通过，Mach-O arm64 Release |
+| 新 Release 本地 `/v1/messages` → 真实公开 API | 通过，现有 default profile / gpt-6.1-sol；流式和非流式都返回 HTTP 200、`SIWC OK`，并确认推理完成 |
+
+最终 Release SHA-256：`9cfdc33d5f0faae70f91650728cca3e6e5b1108d1a1b23659b596011b37f00a7`，与真实复测使用的二进制一致。
+
+真实复测使用临时回环端口和最小文本，不发送项目文件或工具。两次实际上游都为 HTTP 200、Content-Type 缺省；流式转发以 `message_stop` 结束，非流式在上游完成后返回完整 Anthropic JSON。请求 ID 分别为 `req_df9f4ba9790f4a839a00a5dc3649afcf` 和 `req_fafd4d806b45416dae84b9d68df89964`。复测前后凭据文件逐字节摘要相同；测试启动的进程已退出。
+
+真实 OAuth 为用户已完成的授权，本次复用验证；没有重做浏览器登录。Claude Code 实际 Read/Write/Bash/MCP、长会话压缩和 `/resume` 仍待人工验证。单次文本请求完成也不能保证全部模型或工具能力可用。
+
+本次核对的最新官方文档：[模型与推理](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference)、[错误与恢复](https://developers.openai.com/siwc/token-sharing-open-source/errors-and-recovery)、[预览限制](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations)。
