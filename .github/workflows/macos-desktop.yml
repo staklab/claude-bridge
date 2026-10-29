@@ -56,6 +56,7 @@ jobs:
           BRIDGE_NOTARY_PROFILE: bridge-ci
         run: bash scripts/macos/build.sh
       - run: python3 scripts/macos/test_install.py 'dist/Claude Bridge.app'
+      - run: python3 scripts/macos/test_auto_mode.py 'dist/Claude Bridge.app/Contents/Resources/bin/claude-gpt'
       - run: python3 scripts/macos/audit_bundle.py 'dist/Claude Bridge.app'
       - run: hdiutil verify 'dist/Claude Bridge.dmg'
       - name: Archive app preserving executable modes and signatures

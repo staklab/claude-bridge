@@ -73,7 +73,7 @@ fn private_install_rejects_symlink_escape_and_hard_link() {
 #[test]
 fn native_arguments_and_other_settings_survive_connection_isolation() {
     let (_dir, paths) = home();
-    let source = json!({"env":{"ANTHROPIC_BASE_URL":"https://wrong.example","CLAUDE_CODE_USE_BEDROCK":"1","KEEP_ME":"yes"},"permissions":{"defaultMode":"default"}}).to_string();
+    let source = json!({"env":{"ANTHROPIC_BASE_URL":"https://wrong.example","CLAUDE_CODE_USE_BEDROCK":"1","CLAUDE_CODE_AUTO_MODE_SERVER":"1","KEEP_ME":"yes"},"permissions":{"defaultMode":"default"}}).to_string();
     let args: Vec<OsString> = [
         "--resume",
         "conversation-id",
@@ -86,6 +86,7 @@ fn native_arguments_and_other_settings_survive_connection_isolation() {
     .map(OsString::from)
     .collect();
     let before = std::env::var_os("ANTHROPIC_BASE_URL");
+    let auto_mode_before = std::env::var_os("CLAUDE_CODE_AUTO_MODE_SERVER");
     let cwd = std::env::current_dir().unwrap();
     let (forwarded, settings) = launcher::launch_settings(
         &paths,
@@ -104,6 +105,7 @@ fn native_arguments_and_other_settings_survive_connection_isolation() {
         "http://127.0.0.1:12345"
     );
     assert_eq!(settings["env"]["CLAUDE_CODE_USE_BEDROCK"], "0");
+    assert_eq!(settings["env"]["CLAUDE_CODE_AUTO_MODE_SERVER"], "0");
     assert_eq!(settings["env"]["KEEP_ME"], "yes");
     assert_eq!(settings["env"]["ANTHROPIC_API_KEY"], "");
     assert_eq!(settings["env"]["ANTHROPIC_AUTH_TOKEN"], "local-test-cookie");
@@ -113,6 +115,10 @@ fn native_arguments_and_other_settings_survive_connection_isolation() {
         "account-model"
     );
     assert_eq!(std::env::var_os("ANTHROPIC_BASE_URL"), before);
+    assert_eq!(
+        std::env::var_os("CLAUDE_CODE_AUTO_MODE_SERVER"),
+        auto_mode_before
+    );
     assert_eq!(std::env::current_dir().unwrap(), cwd);
 }
 

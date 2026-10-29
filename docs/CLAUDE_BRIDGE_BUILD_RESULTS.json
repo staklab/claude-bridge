@@ -3,7 +3,7 @@
   "version": "0.2.0",
   "target": "aarch64-apple-darwin",
   "minimum_macos": "13.0",
-  "recorded_utc": "2026-10-28T09:03:16+00:00",
+  "recorded_utc": "2026-10-29T01:19:01+00:00",
   "host": {
     "macos": "27.2",
     "architecture": "arm64"
@@ -107,20 +107,81 @@
   ],
   "artifacts": {
     "dist/Claude Bridge.dmg": {
-      "bytes": 19537030,
-      "sha256": "3da6f5763d6fe90faba5915251f4a5876deb0a8f3ee1bd9a47701d512bd69c93"
+      "bytes": 19538103,
+      "sha256": "5da6a212e43efbaafc6bb0ebee6c85cd34e61ae518ebf9c5a06126877d4a832c"
     },
     "dist/native/claude-gpt": {
-      "bytes": 17373168,
-      "sha256": "a767793d13fb8a26ca27a6bd006be46206de3d33c80da341861b65e3fe6f802c"
+      "bytes": 17368752,
+      "sha256": "973b40f3e631ee7aa50c37b637bb98486399cd5e38906d426468b8ac2f5b6fb1"
     },
     "dist/native/claude-code-proxy": {
-      "bytes": 23086704,
-      "sha256": "7fde750f1c94e5d6e4a5909381b4fe3357e49441ce93d49bc50f05485a78a85e"
+      "bytes": 23099696,
+      "sha256": "9cc17b22cd4ea148f51acc978698e298ded81f83316970d2015cd7f05013c2b0"
     },
     "dist/Claude Bridge.app/Contents/MacOS/Claude Bridge": {
       "bytes": 877792,
-      "sha256": "216eb6b3f08decad4f7b5ba8f7badac46dd91044233096e773b532df21af3035"
+      "sha256": "42d0635c53985a2084e8834d1f90db5e425447af5788f806f01c7f5f71f7621e"
     }
+  },
+  "auto_mode_compatibility": {
+    "base_commit": "cb86d37627b1ec7099fec29925e8420374d18937",
+    "official_reference": "https://code.claude.com/docs/en/auto-mode-classifier-billing",
+    "child_environment": {
+      "CLAUDE_CODE_AUTO_MODE_SERVER": "0"
+    },
+    "process_regression": {
+      "passed": 6,
+      "checks": [
+        "child env and permissions: normal",
+        "child env and permissions: --resume fixture-session",
+        "child env and permissions: --continue",
+        "new authenticated dynamic port accepted",
+        "invalid proof rejected; identity probe sends no credentials",
+        "native executable, user files, and parent environment unchanged"
+      ],
+      "real_claude": false,
+      "real_upstream": false
+    },
+    "real_native_and_upstream": {
+      "real_claude": true,
+      "real_upstream": true,
+      "cases": [
+        {
+          "case": "normal",
+          "child_auto_server": "0",
+          "native_permission_mode": "auto",
+          "completed": true,
+          "native_tools": []
+        },
+        {
+          "case": "resume",
+          "child_auto_server": "0",
+          "native_permission_mode": "auto",
+          "completed": true,
+          "native_tools": []
+        },
+        {
+          "case": "continue",
+          "child_auto_server": "0",
+          "native_permission_mode": "auto",
+          "completed": true,
+          "native_tools": [
+            "Bash"
+          ]
+        }
+      ],
+      "new_oauth": false,
+      "permission_bypass": false
+    },
+    "real_native_version": "2.1.310",
+    "real_model_from_current_account": "gpt-6-astra",
+    "global_files_unchanged": true,
+    "native_claude_unchanged": true,
+    "siwc_core_unchanged": true,
+    "proxy_not_stopped_for_update": true,
+    "client_classifier_and_token_usage_preserved": true,
+    "fake_safeguard_results": false,
+    "installed_launcher_and_matching_app_updated": true,
+    "real_post_reboot_test": false
   }
 }

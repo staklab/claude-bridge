@@ -194,6 +194,9 @@ fn connection_environment<'a>(
         ("ANTHROPIC_CUSTOM_HEADERS", ""),
         ("CLAUDE_CODE_API_KEY_HELPER_TTL_MS", "0"),
         ("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1"),
+        // SIWC cannot supply Anthropic's server-side safety verdicts. Keep the
+        // native client classifier and its token usage; disable only server checks.
+        ("CLAUDE_CODE_AUTO_MODE_SERVER", "0"),
         ("DISABLE_LOGIN_COMMAND", "1"),
         ("DISABLE_LOGOUT_COMMAND", "1"),
         ("NO_PROXY", "localhost,127.0.0.1,::1"),

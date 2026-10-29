@@ -28,6 +28,8 @@ claude-gpt -p "请简短说明这个项目"
 
 `claude` 与 `claude-gpt` 是两个独立入口。`claude` 使用您自己的 Anthropic 官方账号或官方 API 配置，完全不依赖 Claude Bridge。ChatGPT 授权并不等于 Claude 官方认证。Claude Bridge 只给它启动的 Claude GPT 进程设置连接信息，不向您的 shell 导出全局 API 环境变量。
 
+Claude GPT 按 [Anthropic 官方网关说明](https://code.claude.com/docs/en/auto-mode-classifier-billing)，仅在自己的 Claude Code 子进程和私有会话设置中设置 `CLAUDE_CODE_AUTO_MODE_SERVER=0`。这取消服务端分类器探测，保留 Auto Mode 的客户端分类器与权限检查；客户端分类器请求仍消耗 Token，不提供免费分类器结果。该变量是官方临时设置，后续 Claude Code 版本可能调整。
+
 可以关闭窗口或退出 Claude Bridge。按需服务和正在运行的会话独立运行；重启 Mac 后，`claude-gpt` 会自动检查并启动服务。空闲且没有 Claude GPT 会话时，服务约五分钟后退出。无需把应用加入开机登录项。
 
 ## 账号、模型与故障处理

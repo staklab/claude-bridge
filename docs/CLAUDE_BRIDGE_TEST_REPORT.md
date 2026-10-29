@@ -81,3 +81,17 @@ GUI 项目启动验证发现 JSON 字符串中的斜线转义不适用于 AppleS
 8. 对存在大量历史的测试账户抽取会话摘要/文件校验，依次修复、重装、升级、卸载启动器，比较前后。用两个已公证版本检验自动更新与失败恢复。确认未覆盖其他同名命令、未重复 PATH、未删除用户 OAuth 或 Claude 会话。
 
 测试人员可在已完成 GUI 设置后运行 `python3 scripts/macos/test_live.py` 复现合成项目回归；这是开发/验收工具，Python 不是 App 用户依赖。
+
+## Auto Mode 网关兼容修复
+
+依据 [Anthropic classifier billing 官方文档](https://code.claude.com/docs/en/auto-mode-classifier-billing)，该提示表示网关不能提供 Anthropic 服务端分类检查，并不表示回环代理或动态端口异常。`src/bridge/launcher.rs` 的统一子进程环境表新增 `CLAUDE_CODE_AUTO_MODE_SERVER=0`，同时沿用现有机制放入该进程的私有会话设置，避免用户设置中的同名值覆盖它。没有修改权限模式、添加权限绕过参数或构造 `safeguard_results`；原 SIWC、OAuth、工具转换和服务管理代码未改动。
+
+**此设置只取消服务端分类器探测。客户端分类器、权限保护及其 Token 消耗仍保留，不代表免费分类器。** 只对新启动的 Claude GPT 进程生效；已有会话可退出后用 `claude-gpt --resume` 恢复。
+
+- `cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`（1196 项、0 失败）、`cargo build --release --locked` 全部通过。
+- `scripts/macos/test_auto_mode.py` 对实际原生启动器执行 6 项进程级检查：普通启动、resume、continue 的子进程环境和私有会话值均为 `0`，即使父环境和传入设置为 `1`；权限配置、参数和 CWD 保留。正确 HMAC 签名的两个不同动态端口均被接受，错误证明被拒绝，身份探测不发送凭据。此检查使用环境记录器子进程，不称作真实 Claude / 账号验证。
+- 本机实际已安装启动器、Claude Code 2.1.310 和当前账号的 `gpt-6-astra`，在临时项目及隔离原生配置中，以 `--permission-mode auto` 完成普通文本、resume、continue；最后一次实际调用 Bash。三个 SessionStart hook 均记录 `CLAUDE_CODE_AUTO_MODE_SERVER=0`，且本地 API 地址来自实际启动的回环服务；三个会话均未出现该资格提示。没有使用权限绕过或工具预批准参数。
+- 真实验收脚本为 `scripts/macos/test_auto_mode_live.py`，须先完成应用授权，会消耗少量套餐用量；只记录目标环境变量和回环地址，不读取原项目。此轮复用已有账号，不重新授权或注册。
+- 原有 `.zshrc`、`.zprofile`、`~/.claude/settings.json`、`~/.claude.json` 与原生 `claude` 的文件哈希前后完全一致。更新仅替换本应用的启动器和匹配 App 包，没有运行安装器或停止代理。
+- 已复查服务按需生命周期：每次读取当前服务元数据，校验安装 ID、随机 challenge 的 HMAC 证明及模型，再复用真实端口；不固定或比较旧端口。真实 SIWC 路由仍仅注册 `SiwcProvider`，生产端点仍为 `https://api.openai.com/v1/responses`，没有新增其他推理或收费通道。
+- 更新后的 App / DMG 已重建，包级安装 30 项及凭据扫描通过；签名、公证和全新系统等未完成项仍按上表保留。
