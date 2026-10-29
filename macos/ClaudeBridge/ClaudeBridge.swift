@@ -57,7 +57,7 @@ final class BridgeModel: ObservableObject {
     var root: URL { FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Claude Bridge") }
     var launcher: URL { root.appendingPathComponent("bin/claude-gpt") }
     var executable: URL { Bundle.main.resourceURL!.appendingPathComponent("bin/claude-gpt") }
-    var version: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.2.0" }
+    var version: String { Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.2.1" }
     var localBuild: Bool { Bundle.main.object(forInfoDictionaryKey: "BridgePublicDistribution") as? Bool != true }
 
     func load() { guard !loaded else { return }; loaded = true; refresh() }
@@ -181,7 +181,7 @@ final class BridgeModel: ObservableObject {
         action("正在保存默认 GPT 模型…") { _ = try await self.json(["set-model", model]); try await self.reload() }
     }
     func test() {
-        action("正在通过 ChatGPT 套餐完成一次轻量推理测试…") {
+        action("正在向 OpenAI 重新检查额度并完成一次轻量推理测试…") {
             _ = try await self.json(["test"]); try await self.reload()
             self.message = "连接测试通过，可以使用 Claude GPT。"
         }
@@ -329,7 +329,7 @@ struct BridgeWindow: View {
             status("本地代理", bridge.serviceRunning ? "身份已验证 · 运行正常" : "按需启动", bridge.serviceRunning)
             status("轻量推理测试", bridge.ready ? "已通过" : "等待测试", bridge.ready)
             if bridge.usageLimited {
-                HStack { Button("Manage usage") { bridge.openUsage() }.buttonStyle(.borderedProminent); Button("重新测试") { bridge.test() }.buttonStyle(.bordered).disabled(bridge.busy) }
+                HStack { Button("Manage usage") { bridge.openUsage() }.buttonStyle(.borderedProminent); Button("重新检查额度") { bridge.test() }.buttonStyle(.bordered).disabled(bridge.busy || bridge.selectedModel.isEmpty || !bridge.permitted) }
             } else {
                 Button("测试连接") { bridge.test() }.buttonStyle(.borderedProminent).disabled(bridge.busy || bridge.selectedModel.isEmpty || !bridge.permitted)
             }

@@ -34,6 +34,9 @@ impl SiwcProvider {
             default_model,
         })
     }
+    pub(crate) fn resume_plan_usage(&self) {
+        self.client.resume_plan_usage();
+    }
     fn model(&self, requested: Option<&str>) -> Result<String> {
         let model = requested.unwrap_or("siwc");
         if model == "siwc" || crate::registry::is_anthropic_alias(model) {

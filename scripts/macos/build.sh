@@ -3,7 +3,7 @@
 set -euo pipefail
 TASK_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 TASK_DIST="${BRIDGE_DIST:-$TASK_ROOT/dist}"
-TASK_VERSION="0.2.0"
+TASK_VERSION="0.2.1"
 TASK_TEAM="${BRIDGE_TEAM_ID:-}"
 TASK_IDENTITY="${BRIDGE_SIGN_IDENTITY:-}"
 TASK_APP="$TASK_DIST/Claude Bridge.app"

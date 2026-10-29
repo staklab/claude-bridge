@@ -1109,6 +1109,166 @@ async fn quota_failure_pauses_new_inference_and_logout_stops_streams() {
 }
 
 #[tokio::test]
+async fn explicit_usage_recheck_clears_http_quota_pause_and_only_quota_replay_entries() {
+    let mock = Mock::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let auth = signed_in(&mock, Store::new(dir.path().join("siwc"))).await;
+    let client = Client::new(auth);
+    let uncertain_request = json!({"input":"possibly executed already"});
+    mock.reply(
+        StatusCode::SERVICE_UNAVAILABLE,
+        json!({"error":{"code":"subscription_sharing_usage_unavailable"}}).to_string(),
+    );
+    assert_eq!(
+        client
+            .responses(&uncertain_request)
+            .await
+            .unwrap_err()
+            .status,
+        503
+    );
+
+    let quota_request = json!({"input":"quota test"});
+    mock.reply(
+        StatusCode::TOO_MANY_REQUESTS,
+        json!({"error":{"code":"subscription_sharing_usage_limit_exceeded"}}).to_string(),
+    );
+    assert_eq!(
+        client.responses(&quota_request).await.unwrap_err().status,
+        429
+    );
+    let paused = client.responses(&quota_request).await.unwrap_err();
+    assert_eq!(paused.body["usage_paused"], true);
+    assert_eq!(mock.count("/v1/responses"), 2);
+    assert!(!client.models().await.unwrap().is_empty());
+    assert_eq!(
+        client.responses(&quota_request).await.unwrap_err().status,
+        429
+    );
+
+    client.resume_plan_usage();
+    let protected = client.responses(&uncertain_request).await.unwrap_err();
+    assert_eq!(protected.status, 503);
+    assert_eq!(protected.body["replay_blocked"], true);
+    mock.reply(StatusCode::OK, text_events());
+    assert_eq!(
+        client.responses(&quota_request).await.unwrap().status(),
+        200
+    );
+    assert_eq!(mock.count("/v1/responses"), 3);
+    assert_eq!(mock.count("/token"), 1);
+}
+
+#[tokio::test]
+async fn explicit_usage_recheck_recovers_stream_quota_and_repauses_if_still_limited() {
+    for stream in [true, false] {
+        let mock = Mock::new().await;
+        let dir = tempfile::tempdir().unwrap();
+        let auth = signed_in(&mock, Store::new(dir.path().join("siwc"))).await;
+        let p = provider(auth);
+        let limited = event(
+            json!({"type":"response.failed","response":{"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"app limit"}}}),
+        );
+        mock.reply(StatusCode::OK, limited.clone());
+        assert!(
+            body(p.handle_messages(request(stream), context()).await)
+                .await
+                .contains("subscription_sharing_usage_limit_exceeded")
+        );
+        assert_eq!(
+            p.handle_messages(request(stream), context()).await.status(),
+            429
+        );
+        assert_eq!(mock.count("/v1/responses"), 1);
+        p.resume_plan_usage();
+        mock.reply(StatusCode::OK, limited);
+        assert!(
+            body(p.handle_messages(request(stream), context()).await)
+                .await
+                .contains("subscription_sharing_usage_limit_exceeded")
+        );
+        assert_eq!(
+            p.handle_messages(request(stream), context()).await.status(),
+            429
+        );
+        assert_eq!(mock.count("/v1/responses"), 2);
+        p.resume_plan_usage();
+        mock.reply(StatusCode::OK, text_events());
+        let response = p.handle_messages(request(stream), context()).await;
+        assert_eq!(response.status(), 200);
+        assert!(body(response).await.contains("你好"));
+        assert_eq!(mock.count("/v1/responses"), 3);
+        assert_eq!(mock.count("/token"), 1);
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn desktop_usage_check_probes_once_and_recovers_without_restarting_provider() {
+    let mock = Mock::new().await;
+    let dir = tempfile::tempdir().unwrap();
+    let auth = signed_in(&mock, Store::new(dir.path().join("siwc"))).await;
+    let p = Arc::new(provider(auth));
+    mock.reply(
+        StatusCode::TOO_MANY_REQUESTS,
+        json!({"error":{"code":"subscription_sharing_usage_limit_exceeded"}}).to_string(),
+    );
+    assert_eq!(
+        p.handle_messages(request(false), context()).await.status(),
+        429
+    );
+    let app = crate::bridge::usage_test_router(p.clone());
+    let call = || {
+        Request::builder()
+            .method("POST")
+            .uri("/bridge/test")
+            .body(Body::empty())
+            .unwrap()
+    };
+    // A check that is still refused must preserve the real error and pause again.
+    mock.reply(
+        StatusCode::TOO_MANY_REQUESTS,
+        json!({"error":{"code":"subscription_sharing_usage_limit_exceeded"}}).to_string(),
+    );
+    let response = app.clone().oneshot(call()).await.unwrap();
+    assert_eq!(response.status(), 429);
+    assert!(
+        body(response)
+            .await
+            .contains("subscription_sharing_usage_limit_exceeded")
+    );
+    assert_eq!(
+        p.handle_messages(request(false), context()).await.status(),
+        429
+    );
+    assert_eq!(mock.count("/v1/responses"), 2);
+
+    mock.data.lock().unwrap().slow_stream = true;
+    mock.reply(StatusCode::OK, text_events().replace("你好", "BRIDGE OK"));
+    let in_progress = tokio::spawn(app.clone().oneshot(call()));
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while mock.count("/v1/responses") != 3 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(app.oneshot(call()).await.unwrap().status(), 409);
+    let response = in_progress.await.unwrap().unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(body(response).await.contains("BRIDGE OK"));
+    assert_eq!(mock.count("/v1/responses"), 3);
+    mock.data.lock().unwrap().slow_stream = false;
+    mock.reply(StatusCode::OK, text_events());
+    assert_eq!(
+        p.handle_messages(request(false), context()).await.status(),
+        200
+    );
+    assert_eq!(mock.count("/v1/responses"), 4);
+    assert_eq!(mock.count("/token"), 1);
+}
+
+#[tokio::test]
 async fn refresh_scope_reduction_blocks_requests_and_earliest_refresh_is_respected() {
     let mock = Mock::new().await;
     let dir = tempfile::tempdir().unwrap();

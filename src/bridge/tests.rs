@@ -73,7 +73,7 @@ fn private_install_rejects_symlink_escape_and_hard_link() {
 #[test]
 fn native_arguments_and_other_settings_survive_connection_isolation() {
     let (_dir, paths) = home();
-    let source = json!({"env":{"ANTHROPIC_BASE_URL":"https://wrong.example","CLAUDE_CODE_USE_BEDROCK":"1","CLAUDE_CODE_AUTO_MODE_SERVER":"1","KEEP_ME":"yes"},"permissions":{"defaultMode":"default"}}).to_string();
+    let source = json!({"env":{"ANTHROPIC_BASE_URL":"https://wrong.example","CLAUDE_CODE_USE_BEDROCK":"1","CLAUDE_CODE_AUTO_MODE_SERVER":"1","CLAUDE_CODE_MAX_RETRIES":"10","KEEP_ME":"yes"},"permissions":{"defaultMode":"default"}}).to_string();
     let args: Vec<OsString> = [
         "--resume",
         "conversation-id",
@@ -87,6 +87,7 @@ fn native_arguments_and_other_settings_survive_connection_isolation() {
     .collect();
     let before = std::env::var_os("ANTHROPIC_BASE_URL");
     let auto_mode_before = std::env::var_os("CLAUDE_CODE_AUTO_MODE_SERVER");
+    let retries_before = std::env::var_os("CLAUDE_CODE_MAX_RETRIES");
     let cwd = std::env::current_dir().unwrap();
     let (forwarded, settings) = launcher::launch_settings(
         &paths,
@@ -106,6 +107,7 @@ fn native_arguments_and_other_settings_survive_connection_isolation() {
     );
     assert_eq!(settings["env"]["CLAUDE_CODE_USE_BEDROCK"], "0");
     assert_eq!(settings["env"]["CLAUDE_CODE_AUTO_MODE_SERVER"], "0");
+    assert_eq!(settings["env"]["CLAUDE_CODE_MAX_RETRIES"], "0");
     assert_eq!(settings["env"]["KEEP_ME"], "yes");
     assert_eq!(settings["env"]["ANTHROPIC_API_KEY"], "");
     assert_eq!(settings["env"]["ANTHROPIC_AUTH_TOKEN"], "local-test-cookie");
@@ -120,6 +122,17 @@ fn native_arguments_and_other_settings_survive_connection_isolation() {
         auto_mode_before
     );
     assert_eq!(std::env::current_dir().unwrap(), cwd);
+    assert_eq!(std::env::var_os("CLAUDE_CODE_MAX_RETRIES"), retries_before);
+}
+
+#[test]
+fn quota_failure_guidance_preserves_code_without_claiming_auth_or_total_balance_failure() {
+    let error = json!({"error":{"code":"subscription_sharing_usage_limit_exceeded","message":"Bearer sensitive-should-never-be-displayed"}});
+    let message = connection_failure(429, &error);
+    assert!(message.contains("subscription_sharing_usage_limit_exceeded / HTTP 429"));
+    assert!(message.contains("这不代表整个账号没有额度"));
+    assert!(message.contains("重新检查额度"));
+    assert!(!message.contains("sensitive-should-never-be-displayed"));
 }
 
 #[test]

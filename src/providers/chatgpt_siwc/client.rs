@@ -384,9 +384,35 @@ impl Client {
             failures: Default::default(),
         }
     }
+    /// Resume only after the user explicitly asks to recheck ChatGPT usage.
+    /// Keep unrelated replay protection, the registration, and credentials intact.
+    pub fn resume_plan_usage(&self) {
+        let mut pause = self.usage_pause.lock().expect("usage pause");
+        self.failures
+            .lock()
+            .expect("SIWC replay guard")
+            .retain(|(_, _, error)| {
+                error.body.pointer("/error/code").and_then(Value::as_str)
+                    != Some("subscription_sharing_usage_limit_exceeded")
+            });
+        *pause = None;
+    }
+
+    fn paused_usage_error(&self) -> Option<ApiError> {
+        self.usage_pause
+            .lock()
+            .expect("usage pause")
+            .clone()
+            .map(|mut error| {
+                // Distinguish an earlier upstream refusal from a new HTTP attempt.
+                error.body["usage_paused"] = json!(true);
+                error
+            })
+    }
+
     async fn request(&self, body: Option<&Value>) -> Result<reqwest::Response, ApiError> {
         if body.is_some()
-            && let Some(error) = self.usage_pause.lock().expect("usage pause").clone()
+            && let Some(error) = self.paused_usage_error()
         {
             return Err(error);
         }
@@ -410,7 +436,7 @@ impl Client {
         }
         for attempt in 0..3 {
             if body.is_some()
-                && let Some(error) = self.usage_pause.lock().expect("usage pause").clone()
+                && let Some(error) = self.paused_usage_error()
             {
                 return Err(error);
             }

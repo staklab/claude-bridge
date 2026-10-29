@@ -6,7 +6,7 @@ use axum::{
     http::{Request, StatusCode},
     middleware::{Next, from_fn_with_state},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
@@ -388,6 +388,57 @@ async fn identity(
     }
 }
 
+#[derive(Clone)]
+struct UsageCheck {
+    provider: Arc<crate::providers::chatgpt_siwc::SiwcProvider>,
+    gate: Arc<tokio::sync::Mutex<()>>,
+}
+
+async fn check_usage(State(state): State<UsageCheck>) -> Response {
+    use crate::Provider;
+    let Ok(_guard) = state.gate.try_lock() else {
+        return (
+            StatusCode::CONFLICT,
+            [("x-should-retry", "false")],
+            Json(json!({"error":{"code":"bridge_usage_check_in_progress","message":"A usage check is already in progress"}})),
+        )
+            .into_response();
+    };
+    // This route is protected by the same local authentication and Origin check
+    // as inference. Ordinary Claude Code retries cannot clear the quota pause.
+    state.provider.resume_plan_usage();
+    let request = serde_json::from_value(usage_test_request()).expect("static test request");
+    state
+        .provider
+        .handle_messages(
+            request,
+            crate::RequestContext {
+                req_id: uuid::Uuid::new_v4().to_string(),
+                session_id: None,
+                session_seq: None,
+                provider: "siwc".into(),
+                traffic: None,
+                monitor: None,
+            },
+        )
+        .await
+}
+
+fn usage_test_request() -> Value {
+    json!({"model":"siwc","stream":false,"max_tokens":32,"messages":[{"role":"user","content":"Reply exactly: BRIDGE OK"}]})
+}
+
+pub(crate) fn usage_test_router(
+    provider: Arc<crate::providers::chatgpt_siwc::SiwcProvider>,
+) -> Router {
+    Router::new()
+        .route("/bridge/test", post(check_usage))
+        .with_state(UsageCheck {
+            provider,
+            gate: Default::default(),
+        })
+}
+
 async fn protect(State(state): State<DaemonState>, request: Request<Body>, next: Next) -> Response {
     if request.headers().contains_key("origin") {
         return StatusCode::FORBIDDEN.into_response();
@@ -440,15 +491,19 @@ pub async fn run_daemon(paths: &Paths, settings: &Settings) -> Result<()> {
         active: Arc::new(AtomicUsize::new(0)),
         touched: Arc::new(Mutex::new(Instant::now())),
     };
-    let provider =
-        crate::providers::chatgpt_siwc::SiwcProvider::new("default".into(), Some(model))?;
+    let provider = Arc::new(crate::providers::chatgpt_siwc::SiwcProvider::new(
+        "default".into(),
+        Some(model),
+    )?);
     let registry = crate::Registry::from_providers(
         crate::config::AliasProvider::Siwc,
-        [Arc::new(provider) as Arc<dyn crate::Provider>],
+        [provider.clone() as Arc<dyn crate::Provider>],
     );
+    let usage_check = usage_test_router(provider);
     let router = Router::new()
         .route("/bridge/identity", get(identity))
         .with_state(state.clone())
+        .merge(usage_check)
         .merge(crate::server::app(Arc::new(registry)))
         .layer(from_fn_with_state(state.clone(), protect));
     atomic_write(
@@ -477,4 +532,57 @@ pub async fn run_daemon(paths: &Paths, settings: &Settings) -> Result<()> {
     .await;
     let _ = fs::remove_file(paths.runtime().join("service.json"));
     result.context("本地服务结束")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn usage_recheck_requires_local_cookie_and_rejects_browser_origins() {
+        let state = DaemonState {
+            connection: Connection {
+                base_url: "http://127.0.0.1:12345".into(),
+                installation_id: "fixture-installation".into(),
+                model: "fixture-model".into(),
+                pid: 1,
+                version: VERSION.into(),
+            },
+            key: "fixture-local-cookie".into(),
+            active: Default::default(),
+            touched: Arc::new(Mutex::new(Instant::now())),
+        };
+        let app = Router::new()
+            .route("/bridge/test", post(|| async { StatusCode::OK }))
+            .layer(from_fn_with_state(state.clone(), protect));
+        for (key, origin, expected) in [
+            (None, None, StatusCode::UNAUTHORIZED),
+            (Some("wrong-cookie"), None, StatusCode::UNAUTHORIZED),
+            (
+                Some("fixture-local-cookie"),
+                Some("http://localhost"),
+                StatusCode::FORBIDDEN,
+            ),
+            (Some("fixture-local-cookie"), None, StatusCode::OK),
+        ] {
+            let mut request = Request::builder().method("POST").uri("/bridge/test");
+            if let Some(key) = key {
+                request = request.header("x-api-key", key);
+            }
+            if let Some(origin) = origin {
+                request = request.header("origin", origin);
+            }
+            let response = app
+                .clone()
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+        }
+        assert_eq!(state.active.load(Ordering::SeqCst), 0);
+    }
 }

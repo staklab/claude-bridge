@@ -20,6 +20,7 @@ import uuid
 launcher = Path(sys.argv[1] if len(sys.argv) > 1 else "target/release/claude-gpt").resolve()
 passed = []
 parent_auto_mode = os.environ.get("CLAUDE_CODE_AUTO_MODE_SERVER")
+parent_retries = os.environ.get("CLAUDE_CODE_MAX_RETRIES")
 with tempfile.TemporaryDirectory(prefix="bridge-auto-mode-") as directory:
     home = Path(directory)
     root = home / "Library/Application Support/Claude Bridge"
@@ -34,6 +35,8 @@ assert args[0] == '--settings'
 settings = json.loads(pathlib.Path(args[1]).read_text())
 print(json.dumps({'auto_server':os.environ.get('CLAUDE_CODE_AUTO_MODE_SERVER'),
     'session_auto_server':settings['env'].get('CLAUDE_CODE_AUTO_MODE_SERVER'),
+    'max_retries':os.environ.get('CLAUDE_CODE_MAX_RETRIES'),
+    'session_max_retries':settings['env'].get('CLAUDE_CODE_MAX_RETRIES'),
     'base_url':os.environ.get('ANTHROPIC_BASE_URL'), 'args':args[2:],
     'permissions':settings.get('permissions'), 'cwd':os.getcwd()}))
 ''')
@@ -44,7 +47,7 @@ print(json.dumps({'auto_server':os.environ.get('CLAUDE_CODE_AUTO_MODE_SERVER'),
     (runtime / "local.key").write_text(key)
     (runtime / "local.key").chmod(0o600)
     native_settings = project / "original-settings.json"
-    original = json.dumps({"env":{"CLAUDE_CODE_AUTO_MODE_SERVER":"1"},"permissions":{"defaultMode":"default"}})
+    original = json.dumps({"env":{"CLAUDE_CODE_AUTO_MODE_SERVER":"1","CLAUDE_CODE_MAX_RETRIES":"10"},"permissions":{"defaultMode":"default"}})
     native_settings.write_text(original)
     (home / ".zshrc").write_text("# existing user shell configuration\n")
     before = {path: path.read_bytes() for path in [child,native_settings,home/".zshrc",root/"settings.json"]}
@@ -81,7 +84,7 @@ print(json.dumps({'auto_server':os.environ.get('CLAUDE_CODE_AUTO_MODE_SERVER'),
 
         def run(server, arguments, succeeds=True):
             (runtime / "service.json").write_text(json.dumps(server.connection))
-            env = os.environ | {"HOME":str(home),"CLAUDE_CODE_AUTO_MODE_SERVER":"1"}
+            env = os.environ | {"HOME":str(home),"CLAUDE_CODE_AUTO_MODE_SERVER":"1","CLAUDE_CODE_MAX_RETRIES":"10"}
             result = subprocess.run([str(launcher),*arguments,"--settings",str(native_settings)],cwd=project,env=env,capture_output=True,timeout=15)
             if not succeeds:
                 assert result.returncode != 0, "Unverified identity was accepted"
@@ -89,6 +92,7 @@ print(json.dumps({'auto_server':os.environ.get('CLAUDE_CODE_AUTO_MODE_SERVER'),
             assert result.returncode == 0, "Launcher did not exec the recorder"
             actual = json.loads(result.stdout)
             assert actual["auto_server"] == actual["session_auto_server"] == "0"
+            assert actual["max_retries"] == actual["session_max_retries"] == "0"
             assert actual["args"] == arguments and actual["permissions"] == {"defaultMode":"default"}
             assert actual["base_url"] == server.connection["base_url"]
             assert Path(actual["cwd"]).resolve() == project.resolve()
@@ -105,6 +109,7 @@ print(json.dumps({'auto_server':os.environ.get('CLAUDE_CODE_AUTO_MODE_SERVER'),
         passed.append("invalid proof rejected; identity probe sends no credentials")
         assert all(path.read_bytes() == data for path,data in before.items())
         assert os.environ.get("CLAUDE_CODE_AUTO_MODE_SERVER") == parent_auto_mode
+        assert os.environ.get("CLAUDE_CODE_MAX_RETRIES") == parent_retries
         passed.append("native executable, user files, and parent environment unchanged")
     finally:
         for server in servers:

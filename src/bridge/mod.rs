@@ -3,6 +3,8 @@ mod install;
 mod launcher;
 mod service;
 #[cfg(test)]
+pub(crate) use service::usage_test_router;
+#[cfg(test)]
 mod tests;
 
 use anyhow::{Context, Result, bail, ensure};
@@ -20,7 +22,7 @@ use std::{
 };
 
 pub const PRODUCT: &str = "org.claudebridge.desktop";
-pub const VERSION: &str = "0.2.0";
+pub const VERSION: &str = "0.2.1";
 pub const SERVICE: &str = "org.claudebridge.agent";
 
 #[derive(Clone)]
@@ -256,24 +258,28 @@ pub async fn test_connection(paths: &Paths) -> Result<Value> {
     let mut settings = Settings::load(paths)?;
     let connection = ensure_service(paths, &settings).await?;
     let cookie = service::secret(paths)?;
-    let response = reqwest::Client::builder().no_proxy().build()?.post(format!("{}/v1/messages", connection.base_url))
-        .header("x-api-key", cookie).json(&json!({"model":"siwc","stream":false,"max_tokens":32,"messages":[{"role":"user","content":"Reply exactly: BRIDGE OK"}]}))
-        .timeout(std::time::Duration::from_secs(120)).send().await?;
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?
+        .post(format!("{}/bridge/test", connection.base_url))
+        .header("x-api-key", cookie)
+        .timeout(std::time::Duration::from_secs(120))
+        .send()
+        .await?;
     let status = response.status();
+    ensure!(
+        status != reqwest::StatusCode::NOT_FOUND,
+        "后台组件需要更新才能重新检查额度。请使用新版 Claude Bridge 修复安装；正在运行的会话不会被自动停止，旧代理空闲退出后会使用新组件。"
+    );
+    let request_id = response
+        .headers()
+        .get("x-openai-request-id")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from);
     let value: Value = response.json().await.context("连接测试没有返回有效结果")?;
     if !status.is_success() {
-        let code = value["error"]["code"]
-            .as_str()
-            .unwrap_or("connection_failed");
-        let safe_code: String = code
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .take(128)
-            .collect();
-        bail!(
-            "连接测试失败（{safe_code} / HTTP {}）。请检查账号权限、模型或 ChatGPT Usage。",
-            status.as_u16()
-        );
+        bail!("{}", connection_failure(status.as_u16(), &value));
     }
     let text: String = value["content"]
         .as_array()
@@ -287,5 +293,22 @@ pub async fn test_connection(paths: &Paths) -> Result<Value> {
     );
     settings.tested_model = settings.model.clone();
     settings.save(paths)?;
-    Ok(json!({"completed":true,"model":settings.model,"request_id":value["upstream_request_id"]}))
+    Ok(json!({"completed":true,"model":settings.model,"request_id":request_id}))
+}
+
+fn connection_failure(status: u16, value: &Value) -> String {
+    let code = value["error"]["code"]
+        .as_str()
+        .unwrap_or("connection_failed");
+    let safe_code: String = code
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .take(128)
+        .collect();
+    if code == "subscription_sharing_usage_limit_exceeded" {
+        return format!(
+            "OpenAI 暂不允许本应用使用套餐或额度（{safe_code} / HTTP {status}）。登录已保留；这不代表整个账号没有额度，也不是重新授权提示。请打开 Manage usage，检查此应用的用量上限和额度使用设置；补充或重置后点击“重新检查额度”，仅发送一次轻量推理验证。是否可使用额外额度由 OpenAI 决定。"
+        );
+    }
+    format!("连接测试失败（{safe_code} / HTTP {status}）。请检查账号权限、模型或 ChatGPT Usage。")
 }

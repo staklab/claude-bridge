@@ -30,6 +30,8 @@ claude-gpt -p "请简短说明这个项目"
 
 Claude GPT 按 [Anthropic 官方网关说明](https://code.claude.com/docs/en/auto-mode-classifier-billing)，仅在自己的 Claude Code 子进程和私有会话设置中设置 `CLAUDE_CODE_AUTO_MODE_SERVER=0`。这取消服务端分类器探测，保留 Auto Mode 的客户端分类器与权限检查；客户端分类器请求仍消耗 Token，不提供免费分类器结果。该变量是官方临时设置，后续 Claude Code 版本可能调整。
 
+启动器也仅在这个子进程中设置 `CLAUDE_CODE_MAX_RETRIES=0`，关闭 Claude Code 客户端的自动 API 重试，减少失败请求的重复发送。这会降低临时故障时的自动恢复能力，不代表代理提供严格的 exactly-once 执行保证。不要把这两个变量写入 shell 启动文件或原生 Claude Code 的全局设置。
+
 可以关闭窗口或退出 Claude Bridge。按需服务和正在运行的会话独立运行；重启 Mac 后，`claude-gpt` 会自动检查并启动服务。空闲且没有 Claude GPT 会话时，服务约五分钟后退出。无需把应用加入开机登录项。
 
 ## 账号、模型与故障处理
@@ -37,6 +39,9 @@ Claude GPT 按 [Anthropic 官方网关说明](https://code.claude.com/docs/en/au
 - 账号需要重新授权时，打开应用的“ChatGPT 账号”页，再次点击 **Continue with ChatGPT**。系统按官方规则刷新正常授权；真正失效时不会切换到其他收费通道。
 - 在“模型与连接”页刷新目录、选择模型并测试。更换模型前先退出正在运行的 Claude GPT 会话。默认模型不再可用时，重新选择账号当前可用模型。
 - 套餐额度或访问限制请使用 **Manage usage**，打开 [ChatGPT 用量设置](https://chatgpt.com/settings/usage)。应用不会自动购买额度。
+- 如果出现 `subscription_sharing_usage_limit_exceeded / HTTP 429`，OpenAI 暂时拒绝本应用使用套餐或额度；这也可能是应用单独的限额，不代表整个账号没有额度，也不等于 OAuth 权限失效。请在 Usage 中检查当前账号、本应用限额及额度使用设置。额外额度、重置卡是否适用于这次 SIWC 请求由 OpenAI 判定，本应用没有另一个“使用额外额度”的请求参数。
+- 补充额度、重置或调整限制后，点击“模型与连接”中的“重新检查额度”（或“测试连接”）。0.2.1 起，该操作会清除本地保存的旧额度拒绝，并通过同一官方接口发送一次轻量推理；成功后现有代理可继续使用，无需退出 Claude Code、重新登录或重新注册客户端。仍被官方拒绝时继续暂停，不自动循环重试，不推测恢复时间。刷新模型目录不会自行清除额度暂停。
+- 如果提示后台组件需要更新，请在新版 App 中修复安装。更新不会强制停止正在运行的会话；旧代理空闲退出后会加载新组件。不要为了排除此额度错误而删除授权或账号记录。
 - “修复安装”会再次检查冲突、保留配置并修复命令、组件和 PATH。已有同名第三方命令、被修改的管理块、符号链接配置文件或不属于当前用户的文件不会被覆盖。
 - 如果 macOS 拒绝后台服务，请在“系统设置 → 通用 → 登录项与扩展”检查后台权限后重试修复。不要关闭系统安全保护。
 - “选择项目启动”会通过 Terminal.app 打开所选目录并启动 Claude GPT，无需控制其他应用的自动化权限。Claude Code 自己的安全说明与项目信任提示仍由您确认。

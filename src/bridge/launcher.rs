@@ -197,6 +197,9 @@ fn connection_environment<'a>(
         // SIWC cannot supply Anthropic's server-side safety verdicts. Keep the
         // native client classifier and its token usage; disable only server checks.
         ("CLAUDE_CODE_AUTO_MODE_SERVER", "0"),
+        // The native client can ignore x-should-retry. Keep retries explicit for
+        // SIWC so a quota refusal cannot repeatedly replay a billed request.
+        ("CLAUDE_CODE_MAX_RETRIES", "0"),
         ("DISABLE_LOGIN_COMMAND", "1"),
         ("DISABLE_LOGOUT_COMMAND", "1"),
         ("NO_PROXY", "localhost,127.0.0.1,::1"),
